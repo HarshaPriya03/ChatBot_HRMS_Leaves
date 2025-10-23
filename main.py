@@ -82,7 +82,7 @@ Table `leaves`
 - ID (int, PK, auto-increment): leave application id
 - empname (varchar): employee name
 - empemail (varchar): employee email
-- leavetype (varchar): 'sick' | 'casual' | 'compoff'
+- leavetype (varchar): 'SICK LEAVE' | 'CASUAL LEAVE' | 'COMP OFF'
 - applied (timestamp): when the leave was applied
 - `from` (datetime): leave start
 - `to` (datetime): leave end
