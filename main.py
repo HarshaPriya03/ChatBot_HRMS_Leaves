@@ -16,8 +16,20 @@ def get_db():
         user="Anika12",
         password="Anika12",
         database="ems",
-        autocommit=True
+        autocommit=True,
+        pool_name="mypool",
+        pool_size=3,
+        pool_reset_session=True
     )
+
+def ensure_connection(conn):
+    """Ensure the connection is alive, reconnect if needed."""
+    try:
+        conn.ping(reconnect=True, attempts=3, delay=1)
+        return conn
+    except mysql.connector.Error:
+        # Reconnect if ping fails
+        return get_db()
 
 def load_model():
     tok = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
@@ -138,15 +150,26 @@ def validate_mysql_syntax(conn, sql: str) -> tuple[bool, str]:
     if sql.strip() == "__SORRY__":
         return False, "Cannot answer with available schema"
     
+    cursor = None
     try:
+        # Ensure connection is alive
+        conn.ping(reconnect=True, attempts=2, delay=0.5)
+        
         cursor = conn.cursor()
         # Use EXPLAIN to validate without executing
-        cursor.execute(f"EXPLAIN {sql}")
+        # Remove semicolon for EXPLAIN
+        sql_to_validate = sql.rstrip(';').strip()
+        cursor.execute(f"EXPLAIN {sql_to_validate}")
         cursor.fetchall()
-        cursor.close()
         return True, ""
+        
     except mysql.connector.Error as e:
         return False, str(e)
+    except Exception as e:
+        return False, f"Unexpected error: {str(e)}"
+    finally:
+        if cursor:
+            cursor.close()
 
 # --------------------- GENERATE + EXECUTE ---------------------
 
@@ -179,11 +202,22 @@ def run_query(conn, sql: str):
     if sql.strip() == "__SORRY__":
         return "__SORRY__: I can only answer using the allowed columns of `leavebalance` and `leaves`."
     
-    cursor = conn.cursor()
-    cursor.execute(sql)
-    rows = cursor.fetchall()
-    cols = [d[0] for d in cursor.description]
-    return cols, rows
+    cursor = None
+    try:
+        # Ensure connection is alive
+        conn.ping(reconnect=True, attempts=2, delay=0.5)
+        
+        cursor = conn.cursor()
+        cursor.execute(sql)
+        rows = cursor.fetchall()
+        cols = [d[0] for d in cursor.description]
+        return cols, rows
+        
+    except mysql.connector.Error as e:
+        raise Exception(f"Query execution failed: {e}")
+    finally:
+        if cursor:
+            cursor.close()
 
 # --------------------- CLI WITH AUTO-CORRECTION ---------------------
 
@@ -195,43 +229,61 @@ def main():
     print("✅ DB connected\n")
 
     print("Ask about only `leavebalance` and `leaves`. Type 'quit' to exit.")
+    
     while True:
-        q = input("\n💬 Question: ").strip()
-        if q.lower() == "quit":
-            break
-        
-        # Generate SQL from model
-        prompt = build_prompt(q)
-        raw_sql = generate_sql(tokenizer, model, prompt)
-        print(f"\n📝 Generated SQL:\n{raw_sql}")
-        
-        if raw_sql == "__SORRY__":
-            print("❌ Cannot answer with available schema")
-            continue
-        
-        # Transpile to MySQL
-        mysql_sql = transpile_to_mysql(raw_sql)
-        print(f"\n📜 MySQL SQL:\n{mysql_sql}")
-        
-        if mysql_sql == "__SORRY__":
-            print("❌ SQL parsing failed")
-            continue
-        
-        # Validate before executing
-        is_valid, error_msg = validate_mysql_syntax(conn, mysql_sql)
-        if not is_valid:
-            print(f"⚠️  SQL Validation Failed: {error_msg}")
-            print("Skipping execution for safety.")
-            continue
-        
-        # Execute
         try:
+            q = input("\n💬 Question: ").strip()
+            if q.lower() == "quit":
+                break
+            
+            # Ensure connection is alive before processing
+            conn = ensure_connection(conn)
+            
+            # Generate SQL from model
+            prompt = build_prompt(q)
+            raw_sql = generate_sql(tokenizer, model, prompt)
+            print(f"\n📝 Generated SQL:\n{raw_sql}")
+            
+            if raw_sql == "__SORRY__":
+                print("❌ Cannot answer with available schema")
+                continue
+            
+            # Transpile to MySQL
+            mysql_sql = transpile_to_mysql(raw_sql)
+            print(f"\n📜 MySQL SQL:\n{mysql_sql}")
+            
+            if mysql_sql == "__SORRY__":
+                print("❌ SQL parsing failed")
+                continue
+            
+            # Validate before executing
+            is_valid, error_msg = validate_mysql_syntax(conn, mysql_sql)
+            if not is_valid:
+                print(f"⚠️  SQL Validation Failed: {error_msg}")
+                print("Attempting to execute anyway...")
+                # Don't skip - sometimes EXPLAIN fails but query works
+            
+            # Execute
             result = run_query(conn, mysql_sql)
             print("📊 Result:", result)
+            
+        except KeyboardInterrupt:
+            print("\n\n👋 Interrupted by user")
+            break
         except Exception as e:
-            print(f"❌ Execution Error: {e}")
+            print(f"❌ Error: {e}")
+            # Try to reconnect
+            try:
+                conn = get_db()
+                print("♻️  Reconnected to database")
+            except:
+                print("❌ Failed to reconnect. Please restart.")
+                break
 
-    conn.close()
+    try:
+        conn.close()
+    except:
+        pass
     print("👋 Bye")
 
 if __name__ == "__main__":
