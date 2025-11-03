@@ -99,7 +99,8 @@ class IntentDetector:
                 "current balance", "check balance", "balance remaining",
                 "CL left", "SL available", "comp off balance",
                 "can I take leave", "eligible for leave", "eligibility",
-                "balance of", "leavebalance of", "what is balance"
+                "balance of", "leavebalance of", "what is balance",
+                "can apply", "able to apply", "can take", "allowed to take"
             ],
             "leaves": [
                 "applied leaves", "leave history", "leaves taken", 
@@ -109,7 +110,9 @@ class IntentDetector:
                 "leaves in January", "on leave today", "who is on leave",
                 "leave between dates", "applied on", "show leaves",
                 "latest leave", "last leave", "recent leave", "when applied",
-                "who applied", "which employee", "person applied", "members on leave"
+                "who applied", "which employee", "person applied", "members on leave",
+                "phone number", "empph", "contact", "records", "list of",
+                "from date", "to date", "leave period", "leave duration"
             ]
         }
         
@@ -130,9 +133,9 @@ class IntentDetector:
         
         if best_score < 0.35:
             q_lower = question.lower()
-            if any(word in q_lower for word in ['balance', 'remaining', 'left', 'available', 'eligible']):
+            if any(word in q_lower for word in ['balance', 'remaining', 'left', 'available', 'eligible', 'can apply', 'can take']):
                 return "leavebalance", 0.6
-            elif any(word in q_lower for word in ['applied', 'history', 'latest', 'reason', 'when', 'days', 'who']):
+            elif any(word in q_lower for word in ['applied', 'history', 'latest', 'reason', 'when', 'days', 'who', 'phone', 'empph', 'contact', 'from', 'to']):
                 return "leaves", 0.6
             return "unknown", best_score
         
@@ -141,10 +144,7 @@ class IntentDetector:
 # --------------------- CONTEXT ANALYSIS ---------------------
 
 def analyze_query_context(question: str) -> dict:
-    """
-    Analyzes the question to extract context without hardcoding keywords.
-    Returns context that helps generate better SQL.
-    """
+    """Analyzes the question to extract context dynamically"""
     q_lower = question.lower()
     context = {
         'has_specific_email': False,
@@ -163,8 +163,7 @@ def analyze_query_context(question: str) -> dict:
         return context
     
     # Detect if asking about multiple/all employees
-    # Look for question words that typically ask about multiple people
-    question_indicators = ['who', 'which', 'what', 'how many']
+    question_indicators = ['who', 'which', 'what', 'how many', 'list', 'show']
     person_plurals = ['employees', 'members', 'people', 'persons', 'staff']
     quantifiers = ['all', 'any', 'every', 'everyone', 'anyone']
     
@@ -172,15 +171,57 @@ def analyze_query_context(question: str) -> dict:
     has_plural = any(word in q_lower for word in person_plurals)
     has_quantifier = any(word in q_lower for word in quantifiers)
     
-    # If asking "who/which/what" OR mentions plural people OR uses quantifiers
     if has_question_word or has_plural or has_quantifier:
         context['is_general_query'] = True
         context['query_scope'] = 'all_employees'
     else:
-        # Default to specific if unclear (safer for privacy)
         context['query_scope'] = 'unclear'
     
     return context
+
+# --------------------- QUICK SYNTAX FIXES ---------------------
+
+def quick_syntax_fix(sql: str) -> str:
+    """Apply immediate regex-based fixes for common issues BEFORE validation"""
+    
+    # Fix NULLS FIRST/LAST
+    sql = re.sub(r'\s+NULLS\s+(FIRST|LAST)', '', sql, flags=re.IGNORECASE)
+    
+    # Fix ILIKE to LIKE
+    sql = re.sub(r'\bILIKE\b', 'LIKE', sql, flags=re.IGNORECASE)
+    
+    # Fix wrong column names
+    sql = re.sub(r'\bltype\b', 'leavetype', sql, flags=re.IGNORECASE)
+    
+    # Fix DATEDIFF - MySQL takes 2 params, not 3
+    sql = re.sub(
+        r"DATEDIFF\s*\(\s*['\"]day['\"]\s*,\s*([^,]+)\s*,\s*([^)]+)\)",
+        r"DATEDIFF(\2, \1)",
+        sql,
+        flags=re.IGNORECASE
+    )
+    
+    # Fix INTERVAL syntax: INTERVAL 'X unit' -> INTERVAL X unit
+    sql = re.sub(
+        r"INTERVAL\s+'(\d+)\s+(day|week|month|year)s?'",
+        r"INTERVAL \1 \2",
+        sql,
+        flags=re.IGNORECASE
+    )
+    
+    # Fix CURRENT_DATE - INTERVAL to DATE_SUB
+    sql = re.sub(
+        r'\(?\s*CURRENT_DATE\s*-\s*INTERVAL\s+(\d+)\s+(DAY|WEEK|MONTH|YEAR)\s*\)?',
+        r'DATE_SUB(CURDATE(), INTERVAL \1 \2)',
+        sql,
+        flags=re.IGNORECASE
+    )
+    
+    # Replace CURRENT_DATE with CURDATE()
+    sql = re.sub(r'\bCURRENT_DATE\(\)\b', 'CURDATE()', sql, flags=re.IGNORECASE)
+    sql = re.sub(r'\bCURRENT_DATE\b', 'CURDATE()', sql, flags=re.IGNORECASE)
+    
+    return sql
 
 # --------------------- SCHEMA TEMPLATES ---------------------
 
@@ -188,42 +229,49 @@ SCHEMA_TEMPLATES = {
     "leavebalance": """
 Table: leavebalance
 Columns:
-  - id: INT PRIMARY KEY
+  - id: PRIMARY KEY
   - empname: VARCHAR (employee name)
-  - empemail: VARCHAR (employee email)
-  - cl: VARCHAR (casual leave remaining)
-  - sl: VARCHAR (sick leave remaining)
-  - co: VARCHAR (comp-off remaining)
+  - empemail: VARCHAR (employee email) - USE THIS, NOT 'email'
+  - cl: VARCHAR (Casual Leave balance - CAST to DECIMAL for math)
+  - sl: VARCHAR (Sick Leave balance - CAST to DECIMAL for math)
+  - co: VARCHAR (Comp Off balance - CAST to DECIMAL for math)
   - lastupdate: DATETIME
-  - icl, isl, ico: VARCHAR (initial allocations)
-  - iupdate: DATETIME
+  - icl, isl, ico, iupdate: initial values
 
-Rules:
-- Column is 'empemail' NOT 'email'
-- Calculate total: CAST(COALESCE(cl,'0') AS DECIMAL) + CAST(COALESCE(sl,'0') AS DECIMAL) + CAST(COALESCE(co,'0') AS DECIMAL)
-- For latest: ORDER BY COALESCE(lastupdate, '1900-01-01') DESC, id DESC LIMIT 1
+CRITICAL RULES:
+- For questions "can X apply for leave" or "leave balance": Query leavebalance table
+- Column name is 'empemail' NOT 'email'
+- To check if someone can take CL: SELECT cl FROM leavebalance WHERE empemail='...'
+- To check if someone can take SL: SELECT sl FROM leavebalance WHERE empemail='...'
+- To check if someone can take CO: SELECT co FROM leavebalance WHERE empemail='...'
+- cl/sl/co are VARCHAR - CAST to DECIMAL: CAST(cl AS DECIMAL(10,2)) > 0
 """,
     
     "leaves": """
 Table: leaves
 Columns:
-  - ID: INT PRIMARY KEY
+  - ID: PRIMARY KEY
   - empname: VARCHAR (employee name)
-  - empemail: VARCHAR (employee email)
-  - leavetype: VARCHAR ('SICK LEAVE', 'CASUAL LEAVE', 'COMP OFF')
-  - applied: TIMESTAMP
-  - `from`: DATETIME (MUST use backticks - reserved keyword)
-  - `to`: DATETIME (MUST use backticks - reserved keyword)
+  - empemail: VARCHAR (employee email) - USE THIS, NOT 'email'
+  - leavetype: VARCHAR (values: 'Casual Leave', 'Sick Leave', 'Comp Off') - USE THIS, NOT 'ltype'
+  - applied: DATETIME (when the leave was applied/submitted)
+  - `from`: DATE (leave start date) - MUST use backticks
+  - `to`: DATE (leave end date) - MUST use backticks
   - desg: VARCHAR (designation)
-  - reason: VARCHAR
-  - empph: VARCHAR
+  - reason: TEXT (leave reason)
+  - empph: VARCHAR (employee phone)
   - work_location: VARCHAR
 
-Rules:
-- Column is 'empemail' NOT 'email'
-- MUST use backticks: `from` and `to`
-- Days: DATEDIFF(`to`, `from`) + 1
-- For latest: ORDER BY applied DESC LIMIT 1
+CRITICAL RULES:
+- For "latest leave", "recent leave", "when took leave": Use `from` and `to` dates, NOT 'applied'
+- Column is 'leavetype' NOT 'ltype'
+- Use UPPER() or LOWER() for case-insensitive matching: LOWER(leavetype) = 'casual leave'
+- For latest leave: ORDER BY `from` DESC or `to` DESC
+- For applied date: Use 'applied' column
+- For leave period/duration: Use `from` and `to` columns
+- Backticks required: `from`, `to`
+- For phone: SELECT empph FROM leaves WHERE empemail='...'
+- MySQL DATEDIFF: DATEDIFF(`to`, `from`) + 1 for total days
 """
 }
 
@@ -240,74 +288,90 @@ def get_schema_for_intent(intent: str) -> str:
 def build_prompt(user_question: str, intent: str, context: dict) -> str:
     schema = get_schema_for_intent(intent)
     
-    # Build context hints dynamically based on analysis
     context_hint = ""
     if context['has_specific_email']:
-        context_hint = f"\nIMPORTANT: Filter by WHERE empemail = '{context['email']}'\n"
+        context_hint = f"\nREQUIRED: WHERE empemail = '{context['email']}'\n"
     elif context['is_general_query']:
-        context_hint = "\nIMPORTANT: Query asks about multiple/all employees. DO NOT filter by specific email. Include empemail in SELECT.\n"
+        context_hint = "\nREQUIRED: Query ALL employees. NO email filter. Include empemail in SELECT.\n"
+    
+    # Add intent-specific hints
+    intent_hint = ""
+    q_lower = user_question.lower()
+    
+    if intent == "leavebalance":
+        intent_hint = "\nFOR THIS QUERY: Use 'leavebalance' table to check cl/sl/co balance. Return balance value.\n"
+    elif intent == "leaves":
+        if any(word in q_lower for word in ['latest', 'recent', 'last', 'when took', 'from', 'to']):
+            intent_hint = "\nFOR THIS QUERY: Use 'leaves' table. Show `from` and `to` dates (leave period), NOT 'applied' date. ORDER BY `from` DESC.\n"
+        else:
+            intent_hint = "\nFOR THIS QUERY: Use 'leaves' table with column 'leavetype' (NOT 'ltype'). Use LOWER(leavetype) for matching.\n"
     
     prompt = f"""### Task
-Generate a valid MySQL/MariaDB SELECT query.
+Generate MySQL/MariaDB query. ONLY use tables 'leavebalance' and 'leaves'.
 
 ### Schema
 {schema}
 
-### MySQL/MariaDB Requirements
-- NO PostgreSQL syntax (NULLS FIRST/LAST, ILIKE, INTERVAL 'text', etc.)
-- Date arithmetic: DATE_SUB(CURDATE(), INTERVAL X DAY/MONTH/YEAR)
-- Reserved words need backticks: `from`, `to`
-- Use LIKE for pattern matching, not ILIKE
-{context_hint}
+### MySQL/MariaDB Syntax (CRITICAL)
+- Column is 'leavetype' NOT 'ltype'
+- Column is 'empemail' NOT 'email'
+- For case-insensitive: LOWER(leavetype) = 'casual leave'
+- For latest leave: ORDER BY `from` DESC (use leave start date, not applied date)
+- DATEDIFF(end, start) - 2 params only
+- Backticks for reserved words: `from`, `to`
+- CURDATE() not CURRENT_DATE
+- NO NULLS FIRST/LAST
+- DATE_SUB(CURDATE(), INTERVAL X DAY/MONTH/YEAR)
+{context_hint}{intent_hint}
 
 ### Question
 {user_question}
 
-### Output only the SQL query with semicolon:
+### SQL:
 """
     return prompt
 
-# --------------------- LLM-BASED SQL REPAIR ---------------------
+# --------------------- LLM REPAIR (IMPROVED) ---------------------
 
-def repair_sql_with_llm(sql: str, error_msg: str, tokenizer, model, schema: str, original_question: str) -> str:
-    """
-    Uses the LLM to repair broken SQL by understanding the error.
-    This is much more powerful than regex-based fixes.
-    """
+def repair_sql_with_llm(sql: str, error_msg: str, tokenizer, model, schema: str, original_question: str, intent: str) -> str:
+    """Improved repair with error-specific fixes"""
     
-    repair_prompt = f"""### Task
-Fix this SQL query to be valid MySQL/MariaDB syntax. The query failed with an error.
+    # First apply quick fixes
+    sql = quick_syntax_fix(sql)
+    
+    # Check if error still exists after quick fix
+    error_lower = error_msg.lower()
+    
+    # Build targeted repair hints
+    if "'ltype'" in error_msg or "ltype" in error_lower:
+        repair_hint = "ERROR: Column 'ltype' does not exist. The correct column name is 'leavetype'. Replace ltype with leavetype."
+        sql = re.sub(r'\bltype\b', 'leavetype', sql, flags=re.IGNORECASE)
+    elif "doesn't exist" in error_lower and "table" in error_lower:
+        repair_hint = "ERROR: Wrong table. ONLY use 'leavebalance' or 'leaves' tables."
+    elif "'email'" in error_msg or (("column" in error_lower or "unknown" in error_lower) and "email" in error_lower):
+        repair_hint = "ERROR: Column 'email' doesn't exist. Use 'empemail' instead."
+        sql = re.sub(r'\bemail\b(?!\w)', 'empemail', sql, flags=re.IGNORECASE)
+    elif "datediff" in error_lower:
+        repair_hint = "ERROR: DATEDIFF takes 2 params in MySQL: DATEDIFF(end_date, start_date)"
+    elif "reserved" in error_lower or "syntax" in error_lower:
+        repair_hint = "ERROR: 'from' and 'to' are reserved keywords. Use backticks: `from`, `to`"
+        sql = re.sub(r'\bfrom\b(?![`\w])', '`from`', sql, flags=re.IGNORECASE)
+        sql = re.sub(r'\bto\b(?![`\w])', '`to`', sql, flags=re.IGNORECASE)
+    else:
+        repair_hint = f"ERROR: {error_msg[:150]}"
+    
+    repair_prompt = f"""Fix this MySQL query for the 'ems' database.
 
-### Database Schema
-{schema}
+{repair_hint}
 
-### Original Question
-{original_question}
+Schema: {schema}
 
-### Failed SQL Query
+Original Question: {original_question}
+
+Broken SQL:
 {sql}
 
-### Error Message
-{error_msg}
-
-### Common MySQL/MariaDB Issues to Fix
-1. Remove NULLS FIRST/LAST (not supported)
-2. Convert INTERVAL 'X unit' → INTERVAL X UNIT
-3. Convert CURRENT_DATE - INTERVAL → DATE_SUB(CURDATE(), INTERVAL ...)
-4. Replace ILIKE with LIKE
-5. Add backticks for reserved words: `from`, `to`
-6. Fix syntax errors
-7. Preserve table and column names exactly as in schema
-8. Keep the semantic meaning of the original query
-
-### Instructions
-- Analyze the error message
-- Fix ONLY the syntax issues
-- Do NOT change the query logic or intent
-- Output ONLY the corrected SQL query with semicolon
-- No explanations, just the fixed query
-
-### Corrected SQL:
+Output ONLY the corrected SQL with no explanations or comments:
 """
     
     inputs = tokenizer(repair_prompt, return_tensors="pt").to(model.device)
@@ -315,24 +379,20 @@ Fix this SQL query to be valid MySQL/MariaDB syntax. The query failed with an er
     with torch.no_grad():
         out = model.generate(
             **inputs,
-            max_new_tokens=400,
+            max_new_tokens=300,
             do_sample=False,
             pad_token_id=tokenizer.eos_token_id
         )
     
     text = tokenizer.decode(out[0], skip_special_tokens=True)
-    
-    # Extract the corrected SQL
-    if "### Corrected SQL:" in text:
-        fixed_sql = text.split("### Corrected SQL:")[-1].strip()
-    else:
-        fixed_sql = text.replace(repair_prompt, "").strip()
-    
-    # Clean up
+    fixed_sql = text.replace(repair_prompt, "").strip()
     fixed_sql = re.sub(r"^```sql\s*|\s*```$", "", fixed_sql, flags=re.IGNORECASE).strip()
     
     if not fixed_sql.endswith(';'):
         fixed_sql = fixed_sql.rstrip() + ';'
+    
+    # Apply quick fixes to repaired SQL
+    fixed_sql = quick_syntax_fix(fixed_sql)
     
     return fixed_sql
 
@@ -351,37 +411,32 @@ def generate_sql(tokenizer, model, prompt: str, max_new_tokens: int = 350) -> st
     
     text = tokenizer.decode(out[0], skip_special_tokens=True)
     
-    if "### Output only the SQL query with semicolon:" in text:
-        sql = text.split("### Output only the SQL query with semicolon:")[-1].strip()
-    elif "### SQL:" in text:
+    if "### SQL:" in text:
         sql = text.split("### SQL:")[-1].strip()
     else:
         sql = text.replace(prompt, "").strip()
     
-    # Clean up
     sql = re.sub(r"^```sql\s*|\s*```$", "", sql, flags=re.IGNORECASE).strip()
     
-    # Take first complete statement
     if ';' in sql:
         sql = sql.split(';')[0].strip() + ';'
     elif not sql.endswith(';'):
         sql += ';'
     
-    if "__SORRY__" in sql.upper() or "cannot" in sql.lower():
+    if "__SORRY__" in sql.upper():
         return "__SORRY__"
+    
+    # Apply quick fixes immediately
+    sql = quick_syntax_fix(sql)
     
     return sql
 
-def validate_and_repair_sql(conn, sql: str, tokenizer, model, schema: str, original_question: str, max_attempts: int = 2) -> tuple:
-    """
-    Validates SQL and uses LLM to repair if invalid.
-    Returns (final_sql, is_valid, attempt_count)
-    """
+def validate_and_repair_sql(conn, sql: str, tokenizer, model, schema: str, original_question: str, intent: str, max_attempts: int = 3) -> tuple:
+    """Validates SQL and uses LLM to repair if invalid"""
     
     current_sql = sql
     
     for attempt in range(max_attempts):
-        # Try to validate
         cursor = None
         try:
             conn.ping(reconnect=True, attempts=2, delay=0.5)
@@ -389,26 +444,25 @@ def validate_and_repair_sql(conn, sql: str, tokenizer, model, schema: str, origi
             sql_to_validate = current_sql.rstrip(';').strip()
             cursor.execute(f"EXPLAIN {sql_to_validate}")
             cursor.fetchall()
-            # Success!
             return current_sql, True, attempt + 1
         except mysql.connector.Error as e:
             error_msg = str(e)
-            print(f"\n⚠️  Validation error (attempt {attempt + 1}/{max_attempts}): {error_msg}")
+            print(f"\n⚠️  Attempt {attempt + 1}/{max_attempts} failed: {error_msg[:150]}...")
             
             if attempt < max_attempts - 1:
-                print("🔧 Using LLM to repair SQL...")
-                current_sql = repair_sql_with_llm(current_sql, error_msg, tokenizer, model, schema, original_question)
-                print(f"🔄 Repaired SQL:\n{current_sql}\n")
+                print("🔧 Repairing SQL...")
+                current_sql = repair_sql_with_llm(current_sql, error_msg, tokenizer, model, schema, original_question, intent)
+                print(f"🔄 Repaired:\n{current_sql}\n")
             else:
                 return current_sql, False, attempt + 1
         except Exception as e:
             error_msg = f"Error: {str(e)}"
-            print(f"\n⚠️  Unexpected error (attempt {attempt + 1}/{max_attempts}): {error_msg}")
+            print(f"\n⚠️  Attempt {attempt + 1}/{max_attempts} failed: {error_msg[:150]}...")
             
             if attempt < max_attempts - 1:
-                print("🔧 Using LLM to repair SQL...")
-                current_sql = repair_sql_with_llm(current_sql, error_msg, tokenizer, model, schema, original_question)
-                print(f"🔄 Repaired SQL:\n{current_sql}\n")
+                print("🔧 Repairing SQL...")
+                current_sql = repair_sql_with_llm(current_sql, error_msg, tokenizer, model, schema, original_question, intent)
+                print(f"🔄 Repaired:\n{current_sql}\n")
             else:
                 return current_sql, False, attempt + 1
         finally:
@@ -439,7 +493,7 @@ def run_query(conn, sql: str):
 
 def main():
     print("="*60)
-    print("INTELLIGENT LEAVE CHATBOT")
+    print("INTELLIGENT LEAVE CHATBOT v2.1 - FIXED")
     print("="*60)
     
     print("\n🔧 Loading SQL model...")
@@ -497,13 +551,13 @@ def main():
             # Validate and auto-repair with LLM
             print("🔍 Validating SQL...")
             final_sql, is_valid, attempts = validate_and_repair_sql(
-                conn, raw_sql, tokenizer, model, schema, q, max_attempts=2
+                conn, raw_sql, tokenizer, model, schema, q, intent, max_attempts=3
             )
             
             if is_valid:
-                print(f"✅ SQL validated successfully (took {attempts} attempt(s))")
+                print(f"✅ SQL validated (took {attempts} attempt(s))")
             else:
-                print(f"⚠️ SQL validation failed after {attempts} attempts, trying execution anyway...")
+                print(f"⚠️ Validation failed after {attempts} attempts, trying execution...")
             
             # Execute
             print("\n🔄 Executing query...")
@@ -523,7 +577,7 @@ def main():
                 
                 header = " | ".join(str(c).ljust(col_widths[i]) for i, c in enumerate(cols))
                 print(f"  {header}")
-                print("  " + "-" * len(header))
+                print(f"  {'-' * len(header)}")
                 
                 for row in rows[:20]:
                     row_str = " | ".join(str(v if v is not None else "NULL").ljust(col_widths[i]) for i, v in enumerate(row))
@@ -539,8 +593,6 @@ def main():
             break
         except Exception as e:
             print(f"❌ Error: {e}")
-            import traceback
-            traceback.print_exc()
     
     try:
         conn.close()
