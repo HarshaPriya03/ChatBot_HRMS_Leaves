@@ -76,7 +76,7 @@ def preprocess_question(question: str) -> tuple:
     elif "this month" in q_lower:
         month_start = today.replace(day=1)
         date_context = f"Date range: {month_start} to {today}"
-        question = question.replace("this month", f"after '{month_start}'")
+        question = question.replace("this month", f"from '{month_start}'")
     
     elif "this year" in q_lower:
         year_start = today.replace(month=1, day=1)
@@ -135,7 +135,8 @@ class IntentDetector:
                 "phone number", "empph", "contact", "records", "list of",
                 "from date", "to date", "leave period", "leave duration",
                 "first leave", "when took", "leave type", "longest leave",
-                "most leaves", "top employees", "how many members", "maximum"
+                "most leaves", "top employees", "how many members", "maximum",
+                "sick leave", "casual leave", "comp off"
             ]
         }
         
@@ -158,7 +159,7 @@ class IntentDetector:
             q_lower = question.lower()
             if any(word in q_lower for word in ['balance', 'remaining', 'left', 'available', 'eligible', 'can apply', 'can take']):
                 return "leavebalance", 0.6
-            elif any(word in q_lower for word in ['applied', 'history', 'latest', 'reason', 'when', 'days', 'who', 'phone', 'empph', 'contact', 'from', 'to', 'duration', 'took', 'type']):
+            elif any(word in q_lower for word in ['applied', 'history', 'latest', 'reason', 'when', 'days', 'who', 'phone', 'empph', 'contact', 'from', 'to', 'duration', 'took', 'type', 'sick', 'casual', 'comp']):
                 return "leaves", 0.6
             return "unknown", best_score
         
@@ -172,7 +173,8 @@ def analyze_query_context(question: str) -> dict:
         'has_specific_email': False,
         'email': None,
         'is_general_query': False,
-        'query_scope': 'unknown'
+        'query_scope': 'unknown',
+        'leave_type': None
     }
     
     # Extract email
@@ -182,22 +184,30 @@ def analyze_query_context(question: str) -> dict:
         context['has_specific_email'] = True
         context['email'] = email_match.group()
         context['query_scope'] = 'specific_employee'
-        return context
+    
+    # Detect leave type
+    if 'sick' in q_lower:
+        context['leave_type'] = 'SICK LEAVE'
+    elif 'casual' in q_lower:
+        context['leave_type'] = 'CASUAL LEAVE'
+    elif 'comp' in q_lower:
+        context['leave_type'] = 'COMP OFF'
     
     # Detect if asking about multiple/all employees
-    question_indicators = ['who', 'which', 'what', 'how many', 'list', 'show', 'give', 'top']
-    person_plurals = ['employees', 'members', 'people', 'persons', 'staff']
-    quantifiers = ['all', 'any', 'every', 'everyone', 'anyone', 'maximum', 'most']
-    
-    has_question_word = any(word in q_lower for word in question_indicators)
-    has_plural = any(word in q_lower for word in person_plurals)
-    has_quantifier = any(word in q_lower for word in quantifiers)
-    
-    if has_question_word or has_plural or has_quantifier:
-        context['is_general_query'] = True
-        context['query_scope'] = 'all_employees'
-    else:
-        context['query_scope'] = 'unclear'
+    if not context['has_specific_email']:
+        question_indicators = ['who', 'which', 'what', 'how many', 'list', 'show', 'give', 'top']
+        person_plurals = ['employees', 'members', 'people', 'persons', 'staff']
+        quantifiers = ['all', 'any', 'every', 'everyone', 'anyone', 'maximum', 'most']
+        
+        has_question_word = any(word in q_lower for word in question_indicators)
+        has_plural = any(word in q_lower for word in person_plurals)
+        has_quantifier = any(word in q_lower for word in quantifiers)
+        
+        if has_question_word or has_plural or has_quantifier:
+            context['is_general_query'] = True
+            context['query_scope'] = 'all_employees'
+        else:
+            context['query_scope'] = 'unclear'
     
     return context
 
@@ -246,6 +256,37 @@ def quick_syntax_fix(sql: str) -> str:
     sql = re.sub(r'\bfrom\b(?![\s`])', '`from`', sql, flags=re.IGNORECASE)
     sql = re.sub(r'\bto\b(?![\s`])', '`to`', sql, flags=re.IGNORECASE)
     
+    # FIX: Remove redundant date checks when using CURDATE() BETWEEN
+    if 'CURDATE() BETWEEN' in sql.upper():
+        # Remove redundant `from` <= date checks
+        sql = re.sub(
+            r"\s+AND\s+`from`\s*<=\s*['\"][\d-]+['\"]",
+            "",
+            sql,
+            flags=re.IGNORECASE
+        )
+        # Remove redundant `to` >= date checks
+        sql = re.sub(
+            r"\s+AND\s+`to`\s*>=\s*['\"][\d-]+['\"]",
+            "",
+            sql,
+            flags=re.IGNORECASE
+        )
+    if not re.search(r'ORDER\s+BY\s+CAST\s*\(\s*(cl|sl|co)', sql, flags=re.IGNORECASE):
+        sql = re.sub(
+            r'\bORDER\s+BY\s+(cl|sl|co)\b(\s+(ASC|DESC))?',
+            lambda m: f'ORDER BY CAST({m.group(1)} AS DECIMAL(10,2)){m.group(2) if m.group(2) else ""}',
+            sql,
+            flags=re.IGNORECASE
+        )
+    
+    # NEW FIX: Cast in WHERE clauses for numeric comparisons
+    sql = re.sub(
+        r'\b(cl|sl|co)\s*([><=]+)\s*([0-9.-]+)',
+        r'CAST(\1 AS DECIMAL(10,2)) \2 \3',
+        sql,
+        flags=re.IGNORECASE
+    )
     return sql
 
 # --------------------- SCHEMA TEMPLATES ---------------------
@@ -277,7 +318,7 @@ Columns:
   - ID: PRIMARY KEY
   - empname: VARCHAR (employee name)
   - empemail: VARCHAR (employee email) - CRITICAL: Use 'empemail' NOT 'email'
-  - leavetype: VARCHAR ('Casual Leave', 'Sick Leave', 'Comp Off') - Use 'leavetype' NOT 'ltype'
+  - leavetype: VARCHAR ('SICK LEAVE', 'CASUAL LEAVE', 'COMP OFF') - Use 'leavetype' NOT 'ltype'
   - applied: DATETIME (when leave was submitted)
   - `from`: DATE (leave start date) - MUST use backticks
   - `to`: DATE (leave end date) - MUST use backticks
@@ -286,21 +327,27 @@ Columns:
   - empph: VARCHAR (employee phone)
   - work_location: VARCHAR
 
-RULES:
-- For "latest/recent leave" → ORDER BY `from` DESC (use leave dates, NOT applied)
-- For "when applied" → Use 'applied' column
-- For "from/to dates" → Use `from` and `to` columns with backticks
-- Column is 'leavetype' NOT 'ltype'
-- Use LOWER(leavetype) for case-insensitive matching
+CRITICAL DATE QUERY RULES:
+- For "on leave today" → WHERE CURDATE() BETWEEN `from` AND `to`
+- For "on leave on specific date" → WHERE '2025-11-06' BETWEEN `from` AND `to`
+- NEVER mix CURDATE() with specific date checks in same query
+- For "latest/recent leave" → ORDER BY `from` DESC LIMIT 1
+- For "latest [SICK/CASUAL/COMP] leave" → WHERE LOWER(leavetype) LIKE '%sick%' ORDER BY `from` DESC LIMIT 1
+- For "when applied" → Use 'applied' column, ORDER BY applied DESC
 - For duration: DATEDIFF(`to`, `from`) + 1
 - For phone: SELECT empph
-- For "on leave today/yesterday" → WHERE CURDATE() BETWEEN `from` AND `to`
+- Column is 'leavetype' NOT 'ltype'
+- Use LOWER(leavetype) LIKE '%keyword%' for case-insensitive matching
 """
 }
 
-def get_schema_for_intent(intent: str) -> str:
+def get_schema_for_intent(intent: str, original_question: str = "") -> str:
+    q_lower = original_question.lower() if original_question else "" 
     if intent == "leavebalance":
-        return SCHEMA_TEMPLATES["leavebalance"]
+        if "can" in q_lower and "apply" in q_lower:
+            intent_hint = "TASK: Check if employee can apply for specified leave type by verifying balance > 0"
+        else:
+            intent_hint = "TASK: Query 'leavebalance' table. Return cl, sl, co values."
     elif intent == "leaves":
         return SCHEMA_TEMPLATES["leaves"]
     else:
@@ -311,7 +358,6 @@ def get_schema_for_intent(intent: str) -> str:
 def build_llama_prompt(user_question: str, intent: str, context: dict) -> str:
     schema = get_schema_for_intent(intent)
     
-    # Build context hints
     # Build context hints
     context_hint = ""
     if context['has_specific_email']:
@@ -330,17 +376,28 @@ def build_llama_prompt(user_question: str, intent: str, context: dict) -> str:
             intent_hint = "TASK: Query 'leavebalance' table. Return cl, sl, co values."
     elif intent == "leaves":
         if any(word in q_lower for word in ['latest', 'recent', 'last']):
-            # Check if it's a general query or specific employee
+            # Add leave type filter if detected
+            leave_type_filter = ""
+            if context['leave_type']:
+                leave_type_filter = f" AND LOWER(leavetype) LIKE '%{context['leave_type'].split()[0].lower()}%'"
+            
             if context['has_specific_email']:
-                intent_hint = f"TASK: Use 'leaves' table. ORDER BY applied DESC for {context['email']}. Show `from`, `to`, leavetype, applied."
+                intent_hint = f"TASK: Use 'leaves' table. Find most recent leave{leave_type_filter} for {context['email']}. ORDER BY `from` DESC LIMIT 1. Show `from`, `to`, leavetype, reason."
             else:
-                intent_hint = "TASK: Use 'leaves' table. ORDER BY applied DESC for ALL employees. Show empname, empemail, `from`, `to`, leavetype, applied."
+                intent_hint = f"TASK: Use 'leaves' table. Find most recent leave{leave_type_filter} for ALL employees. ORDER BY `from` DESC. Show empname, empemail, `from`, `to`, leavetype."
         elif any(word in q_lower for word in ['duration', 'how many days', 'how long']):
             intent_hint = "TASK: Calculate duration using DATEDIFF(`to`, `from`) + 1"
         elif "phone" in q_lower or "contact" in q_lower:
             intent_hint = "TASK: SELECT empph (phone number) from leaves table"
         elif any(word in q_lower for word in ['on leave', 'who is on leave', 'members on leave']):
-            intent_hint = "TASK: Find employees currently on leave WHERE CURDATE() BETWEEN `from` AND `to`"
+            # Check if specific date or today
+            date_pattern = r"on\s+'([\d-]+)'"
+            date_match = re.search(date_pattern, user_question)
+            if date_match:
+                specific_date = date_match.group(1)
+                intent_hint = f"TASK: Find employees on leave on {specific_date}. WHERE '{specific_date}' BETWEEN `from` AND `to`. DO NOT use CURDATE()."
+            else:
+                intent_hint = "TASK: Find employees currently on leave. WHERE CURDATE() BETWEEN `from` AND `to`"
         elif any(word in q_lower for word in ['top', 'most', 'maximum']):
             intent_hint = "TASK: GROUP BY empemail, COUNT leaves, ORDER BY count DESC, use LIMIT"
     
@@ -356,27 +413,54 @@ MYSQL SYNTAX REQUIREMENTS:
 - Reserved words need backticks: `from`, `to`
 - Use CURDATE() not CURRENT_DATE
 - DATEDIFF(end, start) - 2 parameters only
-- For case-insensitive: LOWER(column) = 'value'
+- For case-insensitive: LOWER(column) LIKE '%value%'
 - Date format: 'YYYY-MM-DD'
+- **CRITICAL: cl/sl/co are VARCHAR, use CAST(column AS DECIMAL(10,2)) in ORDER BY for min/max**
 
 {context_hint}
 {intent_hint}
 
-EXAMPLES:
-Q: "what is leave balance of john@example.com"
+# Add these examples to the CRITICAL EXAMPLES section in build_llama_prompt()
+
+CRITICAL EXAMPLES:
+Q: "what is leave balance/ latest leave balance/ latest leavebalance of john@example.com"
 A: SELECT cl, sl, co FROM leavebalance WHERE empemail = 'john@example.com';
+
+Q: "who has the lowest casual leave balance"
+A: SELECT empname, empemail, cl FROM leavebalance ORDER BY CAST(cl AS DECIMAL(10,2)) ASC LIMIT 1;
+
+Q: "who has the highest casual leave balance"
+A: SELECT empname, empemail, cl FROM leavebalance ORDER BY CAST(cl AS DECIMAL(10,2)) DESC LIMIT 1;
+
+Q: "who has the lowest sick leave balance"
+A: SELECT empname, empemail, sl FROM leavebalance ORDER BY CAST(sl AS DECIMAL(10,2)) ASC LIMIT 1;
+
+Q: "what is the leave duration ofputsalaharshapriya@gmail.com in her last leave?" 
+A: SELECT DATEDIFF(`to`, `from`) + 1 FROM leaves WHERE empemail = 'putsalaharshapriya@gmail.com' ORDER BY `from` DESC LIMIT 1;
+
+Q: "top 5 employees with highest comp off balance"
+A: SELECT empname, empemail, co FROM leavebalance ORDER BY CAST(co AS DECIMAL(10,2)) DESC LIMIT 5;
 
 Q: "latest leave of john@example.com"
 A: SELECT empname, `from`, `to`, leavetype, reason FROM leaves WHERE empemail = 'john@example.com' ORDER BY `from` DESC LIMIT 1;
 
+Q: "latest sick leave of john@example.com"
+A: SELECT empname, `from`, `to`, leavetype, reason FROM leaves WHERE empemail = 'john@example.com' AND LOWER(leavetype) LIKE '%sick%' ORDER BY `from` DESC LIMIT 1;
+
 Q: "what is the latest leave applied"
 A: SELECT empname, empemail, `from`, `to`, leavetype, applied FROM leaves ORDER BY applied DESC LIMIT 1;
 
-Q: "which date maximum members applied leave"
-A: SELECT `from` AS leave_date, COUNT(*) AS member_count FROM leaves GROUP BY `from` ORDER BY member_count DESC LIMIT 1;
-
 Q: "who is on leave today"
 A: SELECT empname, empemail, `from`, `to`, leavetype FROM leaves WHERE CURDATE() BETWEEN `from` AND `to`;
+
+Q: "who is on leave on '2025-11-06'"
+A: SELECT empname, empemail, `from`, `to`, leavetype FROM leaves WHERE '2025-11-06' BETWEEN `from` AND `to`;
+
+Q: "list of employees who are on leave on '2025-11-05'"
+A: SELECT empname, empemail, `from`, `to`, leavetype FROM leaves WHERE '2025-11-05' BETWEEN `from` AND `to`;
+
+Q: "how many members are on leave on '2025-11-07'"
+A: SELECT COUNT(*) FROM leaves WHERE '2025-11-07' BETWEEN `from` AND `to`;
 
 Q: "can john@example.com apply for Casual Leave"
 A: SELECT CASE WHEN CAST(cl AS DECIMAL(10,2)) > 0 THEN 'Yes' ELSE 'No' END AS can_apply, cl FROM leavebalance WHERE empemail = 'john@example.com';
@@ -554,7 +638,7 @@ def run_query(conn, sql: str):
 
 def main():
     print("="*60)
-    print("LLAMA 3.1 8B LEAVE CHATBOT v3.1")
+    print("LLAMA 3.1 8B LEAVE CHATBOT v3.2 - FIXED")
     print("="*60)
     
     tokenizer, model = load_model()
@@ -592,6 +676,8 @@ def main():
             # Analyze context
             context = analyze_query_context(q)
             print(f"🔍 Query scope: {context['query_scope']}")
+            if context['leave_type']:
+                print(f"🏷️  Leave type detected: {context['leave_type']}")
             
             # Get schema
             schema = get_schema_for_intent(intent)
