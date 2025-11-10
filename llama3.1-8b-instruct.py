@@ -287,6 +287,13 @@ def quick_syntax_fix(sql: str) -> str:
         sql,
         flags=re.IGNORECASE
     )
+
+    sql = re.sub(
+        r"leavetype\s*=\s*'(sick|casual|comp)'",
+        r"LOWER(leavetype) LIKE '%\1%'",
+        sql,
+        flags=re.IGNORECASE
+    )
     return sql
 
 # --------------------- SCHEMA TEMPLATES ---------------------
@@ -467,6 +474,16 @@ A: SELECT CASE WHEN CAST(cl AS DECIMAL(10,2)) > 0 THEN 'Yes' ELSE 'No' END AS ca
 
 Q: "top 5 employees who took most leaves"
 A: SELECT empname, empemail, COUNT(*) AS leave_count FROM leaves GROUP BY empname, empemail ORDER BY leave_count DESC LIMIT 5;
+
+CRITICAL DATE RANGE RULES:
+1. When asked for "leave records between DATE1 and DATE2" OR "last month records" OR "records from DATE1 to DATE2":
+   → Filter by leave start date: WHERE `from` BETWEEN 'DATE1' AND 'DATE2'
+   
+2. When asked "who is on leave on DATE" OR "members on leave on DATE" OR "who applied leave on DATE":
+   → Find leaves that include that date: WHERE 'DATE' BETWEEN `from` AND `to`
+   
+3. When asked "who is on leave today":
+   → Use: WHERE CURDATE() BETWEEN `from` AND `to`
 
 Now generate MySQL query for:"""
 
