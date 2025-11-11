@@ -29,7 +29,7 @@ def ensure_connection(conn):
         return get_db()
 
 def load_model():
-    print("🔧 Loading Llama 3.1 8B Instruct...")
+    print("Loading Llama 3.1 8B Instruct...")
     tok = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
     
     # Add pad token if not present
@@ -109,7 +109,7 @@ def preprocess_question(question: str) -> tuple:
 
 class IntentDetector:
     def __init__(self):
-        print("🔧 Loading intent detector...")
+        print(" Loading intent detector...")
         self.model = SentenceTransformer('all-MiniLM-L6-v2')
         
         self.intent_examples = {
@@ -144,7 +144,7 @@ class IntentDetector:
             k: self.model.encode(v, convert_to_tensor=True) 
             for k, v in self.intent_examples.items()
         }
-        print("✅ Intent detector ready")
+        print(" Intent detector ready")
     
     def detect(self, question: str):
         q_emb = self.model.encode(question, convert_to_tensor=True)
@@ -622,12 +622,12 @@ def validate_and_repair_sql(conn, sql: str, tokenizer, model, schema: str, origi
             return current_sql, True, attempt + 1
         except mysql.connector.Error as e:
             error_msg = str(e)
-            print(f"\n⚠️  Attempt {attempt + 1}/{max_attempts} failed: {error_msg[:150]}...")
+            print(f"\n  Attempt {attempt + 1}/{max_attempts} failed: {error_msg[:150]}...")
             
             if attempt < max_attempts - 1:
-                print("🔧 Repairing SQL...")
+                print(" Repairing SQL...")
                 current_sql = repair_sql_with_llm(current_sql, error_msg, tokenizer, model, schema, original_question, intent)
-                print(f"🔄 Repaired:\n{current_sql}\n")
+                print(f" Repaired:\n{current_sql}\n")
             else:
                 return current_sql, False, attempt + 1
         finally:
@@ -659,17 +659,17 @@ def main():
     print("="*60)
     
     tokenizer, model = load_model()
-    print("✅ Llama 3.1 8B ready")
+    print(" Llama 3.1 8B ready")
     
     intent_detector = IntentDetector()
     
     conn = get_db()
-    print("✅ DB connected\n")
+    print(" DB connected\n")
     print("Type 'quit' to exit\n")
     
     while True:
         try:
-            q = input("💬 Your Question: ").strip()
+            q = input(" Your Question: ").strip()
             if q.lower() == "quit":
                 break
             
@@ -682,19 +682,19 @@ def main():
             original_q = q
             q, date_context = preprocess_question(q)
             if date_context:
-                print(f"📅 {date_context}")
+                print(f" {date_context}")
             if q != original_q:
-                print(f"🔄 Preprocessed: {q}")
+                print(f" Preprocessed: {q}")
             
             # Detect intent
             intent, confidence = intent_detector.detect(q)
-            print(f"🎯 Intent: {intent} (confidence: {confidence:.2f})")
+            print(f" Intent: {intent} (confidence: {confidence:.2f})")
             
             # Analyze context
             context = analyze_query_context(q)
-            print(f"🔍 Query scope: {context['query_scope']}")
+            print(f" Query scope: {context['query_scope']}")
             if context['leave_type']:
-                print(f"🏷️  Leave type detected: {context['leave_type']}")
+                print(f"  Leave type detected: {context['leave_type']}")
             
             # Get schema
             schema = get_schema_for_intent(intent)
@@ -703,30 +703,30 @@ def main():
             messages = build_llama_prompt(q, intent, context)
             
             # Generate SQL
-            print("⏳ Generating SQL...")
+            print(" Generating SQL...")
             raw_sql = generate_sql(tokenizer, model, messages)
-            print(f"\n📝 Generated SQL:\n{raw_sql}\n")
+            print(f"\n Generated SQL:\n{raw_sql}\n")
             
             # Validate and auto-repair
-            print("🔍 Validating SQL...")
+            print(" Validating SQL...")
             final_sql, is_valid, attempts = validate_and_repair_sql(
                 conn, raw_sql, tokenizer, model, schema, q, intent, max_attempts=3
             )
             
             if is_valid:
-                print(f"✅ SQL validated (took {attempts} attempt(s))")
+                print(f" SQL validated (took {attempts} attempt(s))")
             else:
-                print(f"⚠️ Validation failed after {attempts} attempts, trying execution...")
+                print(f" Validation failed after {attempts} attempts, trying execution...")
             
             # Execute
-            print("\n🔄 Executing query...")
+            print("\n Executing query...")
             cols, rows = run_query(conn, final_sql)
             
             # Display results
             if not rows:
-                print("📭 No results found")
+                print(" No results found")
             else:
-                print(f"\n📊 Results ({len(rows)} rows):\n")
+                print(f"\n Results ({len(rows)} rows):\n")
                 
                 col_widths = [max(len(str(c)), max(len(str(row[i])) for row in rows)) for i, c in enumerate(cols)]
                 
@@ -744,16 +744,16 @@ def main():
             print()
             
         except KeyboardInterrupt:
-            print("\n\n👋 Interrupted")
+            print("\n\n Interrupted")
             break
         except Exception as e:
-            print(f"❌ Error: {e}")
+            print(f" Error: {e}")
     
     try:
         conn.close()
     except:
         pass
-    print("\n👋 Goodbye!")
+    print("\n Exit")
 
 if __name__ == "__main__":
     main()
