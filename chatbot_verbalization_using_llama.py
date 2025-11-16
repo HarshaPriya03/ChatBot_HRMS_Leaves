@@ -28,30 +28,35 @@ def ensure_connection(conn):
     except mysql.connector.Error:
         return get_db()
 
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+
+MODEL_ID = "meta-llama/Meta-Llama-3.1-8B-Instruct"
+
 def load_model():
-    print("Loading Llama 3.1 8B Instruct...")
-    tok = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
-    
-    if tok.pad_token is None:
-        tok.pad_token = tok.eos_token
-    
-    try:
-        mdl = AutoModelForCausalLM.from_pretrained(
-            MODEL_ID,
-            device_map="auto",
-            torch_dtype=torch.float16,
-            trust_remote_code=True,
-            load_in_4bit=True,
-        )
-    except Exception:
-        mdl = AutoModelForCausalLM.from_pretrained(
-            MODEL_ID,
-            device_map="auto",
-            torch_dtype=torch.float16,
-            trust_remote_code=True,
-        )
-    mdl.eval()
-    return tok, mdl
+    print("Loading Llama 3.1 8B Instruct in 4-bit...")
+
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    # 4-bit quantization config for bitsandbytes
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.float16,
+    )
+
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_ID,
+        quantization_config=bnb_config,   # <- modern way instead of load_in_4bit=
+        device_map="auto",                # let accelerate place on GPU
+        trust_remote_code=True,
+    )
+
+    model.eval()
+    print("✅ Llama 3.1 8B loaded in 4-bit & ready")
+    return tokenizer, model
 
 # --------------------- DATE PREPROCESSING ---------------------
 
@@ -239,18 +244,18 @@ def quick_syntax_fix(sql: str) -> str:
     sql = re.sub(r'\bCURRENT_DATE\(\)\b', 'CURDATE()', sql, flags=re.IGNORECASE)
     sql = re.sub(r'\bCURRENT_DATE\b', 'CURDATE()', sql, flags=re.IGNORECASE)
     
-    sql = re.sub(r'\bfrom\b(?![\s`])', '`from`', sql, flags=re.IGNORECASE)
-    sql = re.sub(r'\bto\b(?![\s`])', '`to`', sql, flags=re.IGNORECASE)
+    sql = re.sub(r'\bfrom\b(?![\s`])', 'from', sql, flags=re.IGNORECASE)
+    sql = re.sub(r'\bto\b(?![\s`])', 'to', sql, flags=re.IGNORECASE)
     
     if 'CURDATE() BETWEEN' in sql.upper():
         sql = re.sub(
-            r"\s+AND\s+`from`\s*<=\s*['\"][\d-]+['\"]",
+            r"\s+AND\s+from\s*<=\s*['\"][\d-]+['\"]",
             "",
             sql,
             flags=re.IGNORECASE
         )
         sql = re.sub(
-            r"\s+AND\s+`to`\s*>=\s*['\"][\d-]+['\"]",
+            r"\s+AND\s+to\s*>=\s*['\"][\d-]+['\"]",
             "",
             sql,
             flags=re.IGNORECASE
@@ -310,21 +315,21 @@ Columns:
   - empemail: VARCHAR (employee email) - CRITICAL: Use 'empemail' NOT 'email'
   - leavetype: VARCHAR ('SICK LEAVE', 'CASUAL LEAVE', 'COMP OFF') - Use 'leavetype' NOT 'ltype'
   - applied: DATETIME (when leave was submitted)
-  - `from`: DATE (leave start date) - MUST use backticks
-  - `to`: DATE (leave end date) - MUST use backticks
+  - from: DATE (leave start date) - MUST use backticks
+  - to: DATE (leave end date) - MUST use backticks
   - desg: VARCHAR (designation)
   - reason: TEXT (leave reason)
   - empph: VARCHAR (employee phone)
   - work_location: VARCHAR
 
 CRITICAL DATE QUERY RULES:
-- For "on leave today" → WHERE CURDATE() BETWEEN `from` AND `to`
-- For "on leave on specific date" → WHERE '2025-11-06' BETWEEN `from` AND `to`
+- For "on leave today" → WHERE CURDATE() BETWEEN from AND to
+- For "on leave on specific date" → WHERE '2025-11-06' BETWEEN from AND to
 - NEVER mix CURDATE() with specific date checks in same query
-- For "latest/recent leave" → ORDER BY `from` DESC LIMIT 1
-- For "latest [SICK/CASUAL/COMP] leave" → WHERE LOWER(leavetype) LIKE '%sick%' ORDER BY `from` DESC LIMIT 1
+- For "latest/recent leave" → ORDER BY from DESC LIMIT 1
+- For "latest [SICK/CASUAL/COMP] leave" → WHERE LOWER(leavetype) LIKE '%sick%' ORDER BY from DESC LIMIT 1
 - For "when applied" → Use 'applied' column, ORDER BY applied DESC
-- For duration: DATEDIFF(`to`, `from`) + 1
+- For duration: DATEDIFF(to, from) + 1
 - For phone: SELECT empph
 - Column is 'leavetype' NOT 'ltype'
 - Use LOWER(leavetype) LIKE '%keyword%' for case-insensitive matching
@@ -348,12 +353,14 @@ def get_schema_for_intent(intent: str, original_question: str = "") -> str:
 def build_llama_prompt(user_question: str, intent: str, context: dict) -> str:
     schema = get_schema_for_intent(intent)
     
+    # Build context hints
     context_hint = ""
     if context['has_specific_email']:
         context_hint = f"FILTER: WHERE empemail = '{context['email']}'"
     elif context['is_general_query']:
         context_hint = "FILTER: Query ALL employees. DO NOT filter by specific email. Include empname and empemail in SELECT."
     
+    # Add intent-specific hints
     q_lower = user_question.lower()
     intent_hint = ""
     
@@ -371,7 +378,8 @@ def build_llama_prompt(user_question: str, intent: str, context: dict) -> str:
             if context['has_specific_email']:
                 intent_hint = f"TASK: Use 'leaves' table. Find most recent leave{leave_type_filter} for {context['email']}. ORDER BY `from` DESC LIMIT 1. Show `from`, `to`, leavetype, reason."
             else:
-                intent_hint = f"TASK: Use 'leaves' table. Find most recent leave{leave_type_filter} for ALL employees. ORDER BY `from` DESC. Show empname, empemail, `from`, `to`, leavetype."
+                # FIXED: Make it more explicit
+                intent_hint = f"TASK: Use 'leaves' table. Find most recent leave{leave_type_filter} across ALL employees (no email filter). ORDER BY `from` DESC LIMIT 1. Show empname, empemail, `from`, `to`, leavetype."
         elif any(word in q_lower for word in ['duration', 'how many days', 'how long']):
             intent_hint = "TASK: Calculate duration using DATEDIFF(`to`, `from`) + 1"
         elif "phone" in q_lower or "contact" in q_lower:
@@ -387,6 +395,12 @@ def build_llama_prompt(user_question: str, intent: str, context: dict) -> str:
         elif any(word in q_lower for word in ['top', 'most', 'maximum']):
             intent_hint = "TASK: GROUP BY empemail, COUNT leaves, ORDER BY count DESC, use LIMIT"
     
+    # CRITICAL: Add explicit warning against using example emails
+    warning = ""
+    if context['is_general_query'] or not context['has_specific_email']:
+        warning = "\n⚠️ CRITICAL WARNING: Do NOT use 'john@example.com' or any example emails from below. The query should work for ALL employees without email filtering.\n"
+    
+    # Build system prompt with examples
     system_prompt = f"""You are a MySQL query generator for an Employee Management System (EMS) database.
 
 DATABASE SCHEMA:
@@ -404,6 +418,7 @@ MYSQL SYNTAX REQUIREMENTS:
 
 {context_hint}
 {intent_hint}
+{warning}
 
 CRITICAL EXAMPLES:
 Q: "what is leave balance/ latest leave balance/ latest leavebalance of john@example.com"
@@ -432,6 +447,9 @@ A: SELECT empname, `from`, `to`, leavetype, reason FROM leaves WHERE empemail = 
 
 Q: "what is the latest leave applied"
 A: SELECT empname, empemail, `from`, `to`, leavetype, applied FROM leaves ORDER BY applied DESC LIMIT 1;
+
+Q: "what is the latest leave record"
+A: SELECT empname, empemail, `from`, `to`, leavetype, reason FROM leaves ORDER BY `from` DESC LIMIT 1;
 
 Q: "who is on leave today"
 A: SELECT empname, empemail, `from`, `to`, leavetype FROM leaves WHERE CURDATE() BETWEEN `from` AND `to`;
@@ -465,6 +483,7 @@ Now generate MySQL query for:"""
 
     user_message = f"Question: {user_question}"
     
+    # Llama 3.1 Instruct format
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_message}
@@ -497,8 +516,11 @@ def generate_sql(tokenizer, model, messages: list, max_new_tokens: int = 400) ->
     generated_ids = out[0][inputs['input_ids'].shape[1]:]
     sql = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
     
-    sql = re.sub(r"^```sql\s*|\s*```$", "", sql, flags=re.IGNORECASE).strip()
-    sql = re.sub(r"^SQL:\s*|^A:\s*|^Answer:\s*", "", sql, flags=re.IGNORECASE).strip()
+    sql = re.sub(r'```sql\s*', '', sql, flags=re.IGNORECASE | re.DOTALL)
+    sql = re.sub(r'```\s*$', '', sql, flags=re.IGNORECASE | re.DOTALL)
+    sql = re.sub(r'^```\s*', '', sql, flags=re.IGNORECASE | re.DOTALL)
+    sql = re.sub(r'^(SQL:|A:|Answer:)\s*', '', sql, flags=re.IGNORECASE | re.MULTILINE)
+    sql = sql.strip()
     
     if ';' in sql:
         sql = sql.split(';')[0].strip() + ';'
@@ -525,9 +547,9 @@ def repair_sql_with_llm(sql: str, error_msg: str, tokenizer, model, schema: str,
     elif "datediff" in error_lower:
         repair_hint = "ERROR: DATEDIFF in MySQL takes 2 params: DATEDIFF(end_date, start_date)"
     elif "reserved" in error_lower or "syntax" in error_lower:
-        repair_hint = "ERROR: 'from' and 'to' are reserved keywords. Use backticks: `from`, `to`"
-        sql = re.sub(r'\bfrom\b(?![`\s])', '`from`', sql, flags=re.IGNORECASE)
-        sql = re.sub(r'\bto\b(?![`\s])', '`to`', sql, flags=re.IGNORECASE)
+        repair_hint = "ERROR: 'from' and 'to' are reserved keywords. Use backticks: from, to"
+        sql = re.sub(r'\bfrom\b(?![`\s])', 'from', sql, flags=re.IGNORECASE)
+        sql = re.sub(r'\bto\b(?![`\s])', 'to', sql, flags=re.IGNORECASE)
     else:
         repair_hint = f"ERROR: {error_msg[:200]}"
     
@@ -565,7 +587,9 @@ Provide ONLY the corrected SQL query, nothing else."""
     generated_ids = out[0][inputs['input_ids'].shape[1]:]
     fixed_sql = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
     
-    fixed_sql = re.sub(r"^```sql\s*|\s*```$", "", fixed_sql, flags=re.IGNORECASE).strip()
+    fixed_sql = re.sub(r'```sql\s*', '', fixed_sql, flags=re.IGNORECASE | re.DOTALL)
+    fixed_sql = re.sub(r'```\s*', '', fixed_sql, flags=re.IGNORECASE | re.DOTALL)
+    fixed_sql = fixed_sql.strip()
     
     if not fixed_sql.endswith(';'):
         fixed_sql = fixed_sql.rstrip() + ';'
@@ -630,7 +654,8 @@ def verbalize_results(tokenizer, model, user_question: str, cols: list, rows: li
     
     # Format data for the model
     data_summary = format_data_for_verbalization(cols, rows)
-    
+    estimated_tokens = len(rows) * 70 + 300
+    max_tokens = min(estimated_tokens, 4000)
     system_prompt = """You are a data presenter that converts database results into readable text.
 
 CRITICAL RULES:
@@ -683,7 +708,7 @@ IMPORTANT: Copy names and data EXACTLY as shown above. Do not modify any values.
     with torch.no_grad():
         out = model.generate(
             **inputs,
-            max_new_tokens=500,
+            max_new_tokens=max_tokens,
             do_sample=False,  # Changed from True to False for more deterministic output
             temperature=0.1,   # Changed from 0.7 to 0.1 for less creativity
             top_p=0.95,        # Changed from 0.9
@@ -697,25 +722,23 @@ IMPORTANT: Copy names and data EXACTLY as shown above. Do not modify any values.
     # Clean up any artifacts from generation
     response = re.sub(r"^(Response:|Answer:|A:)\s*", "", response, flags=re.IGNORECASE).strip()
     
-    return response
+    if len(rows) > 20:
+        response += f"\n\n... and {len(rows) - 20} more employees (showing first 20 results)"
 
-def format_data_for_verbalization(cols: list, rows: list, max_rows: int = 50) -> str:
+    return response
+def format_data_for_verbalization(cols: list, rows: list, max_rows: int = 20) -> str:  # Reduced from 50 to 20
     """
     Format query results into a readable string for the LLM
     """
     if not rows:
         return "No data"
-    
-    # Limit rows to avoid context overflow
     limited_rows = rows[:max_rows]
     
-    # Add column headers explicitly
     formatted_lines = [f"Columns: {', '.join(cols)}\n"]
     
     for i, row in enumerate(limited_rows, 1):
         row_data = []
         for col, val in zip(cols, row):
-            # Make it very explicit what each value is
             if val is not None:
                 row_data.append(f"{col}: {val}")
             else:
@@ -723,9 +746,36 @@ def format_data_for_verbalization(cols: list, rows: list, max_rows: int = 50) ->
         formatted_lines.append(f"Row {i}: {', '.join(row_data)}")
     
     if len(rows) > max_rows:
-        formatted_lines.append(f"\n... and {len(rows) - max_rows} more rows (not shown)")
+        formatted_lines.append(f"\n... and {len(rows) - max_rows} more rows (not shown in verbalization)")
     
     return "\n".join(formatted_lines)
+# def format_data_for_verbalization(cols: list, rows: list, max_rows: int = 50) -> str:
+#     """
+#     Format query results into a readable string for the LLM
+#     """
+#     if not rows:
+#         return "No data"
+    
+#     # Limit rows to avoid context overflow
+#     limited_rows = rows[:max_rows]
+    
+#     # Add column headers explicitly
+#     formatted_lines = [f"Columns: {', '.join(cols)}\n"]
+    
+#     for i, row in enumerate(limited_rows, 1):
+#         row_data = []
+#         for col, val in zip(cols, row):
+#             # Make it very explicit what each value is
+#             if val is not None:
+#                 row_data.append(f"{col}: {val}")
+#             else:
+#                 row_data.append(f"{col}: NULL")
+#         formatted_lines.append(f"Row {i}: {', '.join(row_data)}")
+    
+#     if len(rows) > max_rows:
+#         formatted_lines.append(f"\n... and {len(rows) - max_rows} more rows (not shown)")
+    
+#     return "\n".join(formatted_lines)
 
 # --------------------- MAIN ---------------------
 
@@ -779,7 +829,7 @@ def main():
             messages = build_llama_prompt(q, intent, context)
             
             # Generate SQL
-            print("⚙️  Generating SQL...")
+            print("⚙  Generating SQL...")
             raw_sql = generate_sql(tokenizer, model, messages)
             print(f"\n📝 Generated SQL:\n{raw_sql}\n")
             
@@ -792,7 +842,7 @@ def main():
             if is_valid:
                 print(f"✅ SQL validated (took {attempts} attempt(s))")
             else:
-                print(f"⚠️  Validation failed after {attempts} attempts, trying execution...")
+                print(f"⚠  Validation failed after {attempts} attempts, trying execution...")
             
             # Execute
             print("\n🔄 Executing query...")
@@ -829,7 +879,7 @@ def main():
             print("="*60 + "\n")
             
         except KeyboardInterrupt:
-            print("\n\n⚠️  Interrupted")
+            print("\n\n⚠  Interrupted")
             break
         except Exception as e:
             print(f"❌ Error: {e}")
