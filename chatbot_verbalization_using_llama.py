@@ -1,6 +1,6 @@
 import mysql.connector
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 import re
 import datetime
 from sentence_transformers import SentenceTransformer, util
@@ -28,10 +28,6 @@ def ensure_connection(conn):
     except mysql.connector.Error:
         return get_db()
 
-from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
-
-MODEL_ID = "meta-llama/Meta-Llama-3.1-8B-Instruct"
-
 def load_model():
     print("Loading Llama 3.1 8B Instruct in 4-bit...")
 
@@ -49,8 +45,8 @@ def load_model():
 
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_ID,
-        quantization_config=bnb_config,   # <- modern way instead of load_in_4bit=
-        device_map="auto",                # let accelerate place on GPU
+        quantization_config=bnb_config,   
+        device_map="auto",                
         trust_remote_code=True,
     )
 
@@ -180,6 +176,16 @@ def analyze_query_context(question: str) -> dict:
         'query_scope': 'unknown',
         'leave_type': None
     }
+
+    specific_leave_keywords = ['casual leave', 'sick leave', 'comp off', 
+                               'cl ', 'sl ', 'co ', 'casual', 'sick', 'comp']
+    total_keywords = ['total', 'overall', 'combined', 'leave balance', 'all leaves']
+    
+    has_specific_type = any(keyword in q_lower for keyword in specific_leave_keywords)
+    has_total_keyword = any(keyword in q_lower for keyword in total_keywords)
+    
+    if not has_specific_type or has_total_keyword:
+        context['is_total_balance_query'] = True
     
     email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
     email_match = re.search(email_pattern, question)
@@ -282,6 +288,12 @@ def quick_syntax_fix(sql: str) -> str:
         sql,
         flags=re.IGNORECASE
     )
+    
+    # Add DISTINCT for phone queries
+    if re.search(r'SELECT\s+empph\s+FROM', sql, flags=re.IGNORECASE) and \
+       not re.search(r'SELECT\s+DISTINCT', sql, flags=re.IGNORECASE):
+        sql = re.sub(r'SELECT\s+empph', 'SELECT DISTINCT empph', sql, flags=re.IGNORECASE)
+    
     return sql
 
 # --------------------- SCHEMA TEMPLATES ---------------------
@@ -305,6 +317,9 @@ RULES:
 - Column is 'empemail' NOT 'email'
 - cl/sl/co are VARCHAR → Use CAST(cl AS DECIMAL(10,2)) for comparisons
 - For latest leavebalance/total balance: CAST(cl AS DECIMAL) + CAST(sl AS DECIMAL) + CAST(co AS DECIMAL)
+- **CRITICAL: When user asks for "leave balance less than X" or "total balance less than X", 
+  calculate TOTAL: (CAST(cl AS DECIMAL) + CAST(sl AS DECIMAL) + CAST(co AS DECIMAL)) < X**
+- **NEVER use OR conditions for total leave balance queries**
 """,
     
     "leaves": """
@@ -330,7 +345,7 @@ CRITICAL DATE QUERY RULES:
 - For "latest [SICK/CASUAL/COMP] leave" → WHERE LOWER(leavetype) LIKE '%sick%' ORDER BY from DESC LIMIT 1
 - For "when applied" → Use 'applied' column, ORDER BY applied DESC
 - For duration: DATEDIFF(to, from) + 1
-- For phone: SELECT empph
+- For phone: SELECT DISTINCT empph LIMIT 1
 - Column is 'leavetype' NOT 'ltype'
 - Use LOWER(leavetype) LIKE '%keyword%' for case-insensitive matching
 """
@@ -365,7 +380,19 @@ def build_llama_prompt(user_question: str, intent: str, context: dict) -> str:
     intent_hint = ""
     
     if intent == "leavebalance":
-        if "can" in q_lower and "apply" in q_lower:
+        if context.get('is_total_balance_query', False):
+            if any(word in q_lower for word in ['less than', '<', 'below', 'under']):
+                intent_hint = """TASK: Query 'leavebalance' table for TOTAL leave balance.
+Calculate: (CAST(cl AS DECIMAL(10,2)) + CAST(sl AS DECIMAL(10,2)) + CAST(co AS DECIMAL(10,2))) AS total_balance
+Use WHERE clause with the same calculation.
+Include empname, empemail, cl, sl, co, total_balance in SELECT."""
+            elif any(word in q_lower for word in ['greater than', '>', 'above', 'more than']):
+                intent_hint = "TASK: Query 'leavebalance' table for TOTAL balance > threshold. Use same calculation."
+        elif context['leave_type']:
+            # Specific leave type query
+            leave_col = 'cl' if 'CASUAL' in context['leave_type'] else 'sl' if 'SICK' in context['leave_type'] else 'co'
+            intent_hint = f"TASK: Query 'leavebalance' table. Filter by {leave_col} only. Use CAST({leave_col} AS DECIMAL(10,2)) in WHERE."
+        elif "can" in q_lower and "apply" in q_lower:
             intent_hint = "TASK: Check if employee can apply for specified leave type by verifying balance > 0"
         else:
             intent_hint = "TASK: Query 'leavebalance' table. Return cl, sl, co values."
@@ -378,12 +405,11 @@ def build_llama_prompt(user_question: str, intent: str, context: dict) -> str:
             if context['has_specific_email']:
                 intent_hint = f"TASK: Use 'leaves' table. Find most recent leave{leave_type_filter} for {context['email']}. ORDER BY `from` DESC LIMIT 1. Show `from`, `to`, leavetype, reason."
             else:
-                # FIXED: Make it more explicit
                 intent_hint = f"TASK: Use 'leaves' table. Find most recent leave{leave_type_filter} across ALL employees (no email filter). ORDER BY `from` DESC LIMIT 1. Show empname, empemail, `from`, `to`, leavetype."
         elif any(word in q_lower for word in ['duration', 'how many days', 'how long']):
             intent_hint = "TASK: Calculate duration using DATEDIFF(`to`, `from`) + 1"
         elif "phone" in q_lower or "contact" in q_lower:
-            intent_hint = "TASK: SELECT empph (phone number) from leaves table"
+            intent_hint = "TASK: SELECT DISTINCT empph (phone number) from leaves table LIMIT 1"
         elif any(word in q_lower for word in ['on leave', 'who is on leave', 'members on leave']):
             date_pattern = r"on\s+'([\d-]+)'"
             date_match = re.search(date_pattern, user_question)
@@ -400,7 +426,6 @@ def build_llama_prompt(user_question: str, intent: str, context: dict) -> str:
     if context['is_general_query'] or not context['has_specific_email']:
         warning = "\n⚠️ CRITICAL WARNING: Do NOT use 'john@example.com' or any example emails from below. The query should work for ALL employees without email filtering.\n"
     
-    # Build system prompt with examples
     system_prompt = f"""You are a MySQL query generator for an Employee Management System (EMS) database.
 
 DATABASE SCHEMA:
@@ -433,7 +458,7 @@ A: SELECT empname, empemail, cl FROM leavebalance ORDER BY CAST(cl AS DECIMAL(10
 Q: "who has the lowest sick leave balance"
 A: SELECT empname, empemail, sl FROM leavebalance ORDER BY CAST(sl AS DECIMAL(10,2)) ASC LIMIT 1;
 
-Q: "what is the leave duration ofputsalaharshapriya@gmail.com in her last leave?" 
+Q: "what is the leave duration of putsalaharshapriya@gmail.com in her last leave?" 
 A: SELECT DATEDIFF(`to`, `from`) + 1 FROM leaves WHERE empemail = 'putsalaharshapriya@gmail.com' ORDER BY `from` DESC LIMIT 1;
 
 Q: "top 5 employees with highest comp off balance"
@@ -468,6 +493,9 @@ A: SELECT CASE WHEN CAST(cl AS DECIMAL(10,2)) > 0 THEN 'Yes' ELSE 'No' END AS ca
 
 Q: "top 5 employees who took most leaves"
 A: SELECT empname, empemail, COUNT(*) AS leave_count FROM leaves GROUP BY empname, empemail ORDER BY leave_count DESC LIMIT 5;
+
+Q: "phone number of john@example.com"
+A: SELECT DISTINCT empph FROM leaves WHERE empemail = 'john@example.com' LIMIT 1;
 
 CRITICAL DATE RANGE RULES:
 1. When asked for "leave records between DATE1 and DATE2" OR "last month records" OR "records from DATE1 to DATE2":
@@ -505,31 +533,25 @@ def generate_sql(tokenizer, model, messages: list, max_new_tokens: int = 400) ->
     with torch.no_grad():
         out = model.generate(
             **inputs,
-            max_new_tokens=max_new_tokens,
+            max_new_tokens=350,
             do_sample=False,
             temperature=0.1,
-            top_p=0.9,
-            pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id,
+            pad_token_id=tokenizer.pad_token_id
         )
     
     generated_ids = out[0][inputs['input_ids'].shape[1]:]
-    sql = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+    fixed_sql = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
     
-    sql = re.sub(r'```sql\s*', '', sql, flags=re.IGNORECASE | re.DOTALL)
-    sql = re.sub(r'```\s*$', '', sql, flags=re.IGNORECASE | re.DOTALL)
-    sql = re.sub(r'^```\s*', '', sql, flags=re.IGNORECASE | re.DOTALL)
-    sql = re.sub(r'^(SQL:|A:|Answer:)\s*', '', sql, flags=re.IGNORECASE | re.MULTILINE)
-    sql = sql.strip()
+    fixed_sql = re.sub(r'```sql\s*', '', fixed_sql, flags=re.IGNORECASE | re.DOTALL)
+    fixed_sql = re.sub(r'```\s*', '', fixed_sql, flags=re.IGNORECASE | re.DOTALL)
+    fixed_sql = fixed_sql.strip()
     
-    if ';' in sql:
-        sql = sql.split(';')[0].strip() + ';'
-    elif not sql.endswith(';'):
-        sql += ';'
+    if not fixed_sql.endswith(';'):
+        fixed_sql = fixed_sql.rstrip() + ';'
     
-    sql = quick_syntax_fix(sql)
+    fixed_sql = quick_syntax_fix(fixed_sql)
     
-    return sql
+    return fixed_sql
 
 # --------------------- LLM REPAIR ---------------------
 
@@ -643,54 +665,162 @@ def run_query(conn, sql: str):
         if cursor:
             cursor.close()
 
+def preformat_results(cols: list, rows: list, user_question: str) -> str:
+    """
+    Pre-format query results into bullet points to guarantee all rows are shown.
+    """
+    if not rows:
+        return "No results found."
+    
+    formatted_lines = []
+    q_lower = user_question.lower()
+    
+    # Detect what type of query this is
+    is_balance_query = any(word in q_lower for word in ['balance', 'cl', 'sl', 'co'])
+    is_leave_query = any(word in q_lower for word in ['leave', 'from', 'to', 'applied'])
+    
+    for row in rows:
+        line_parts = []
+        
+        # Always start with name if available
+        if 'empname' in [c.lower() for c in cols]:
+            name_idx = [c.lower() for c in cols].index('empname')
+            line_parts.append(row[name_idx])
+        
+        # Add email if available
+        if 'empemail' in [c.lower() for c in cols]:
+            email_idx = [c.lower() for c in cols].index('empemail')
+            line_parts.append(f"({row[email_idx]})")
+        
+        # Add relevant data based on columns
+        for i, col in enumerate(cols):
+            col_lower = col.lower()
+            
+            # Skip already processed columns
+            if col_lower in ['empname', 'empemail', 'id']:
+                continue
+            
+            value = row[i]
+            
+            # Format based on column type
+            if col_lower in ['cl', 'sl', 'co']:
+                col_name = {'cl': 'Casual Leave', 'sl': 'Sick Leave', 'co': 'Comp Off'}[col_lower]
+                line_parts.append(f"{col_name}: {value} days")
+            elif col_lower == 'total_balance':
+                line_parts.append(f"Total: {value} days")
+            elif col_lower in ['from', 'to']:
+                line_parts.append(f"{col}: {value}")
+            elif col_lower == 'leavetype':
+                line_parts.append(f"Type: {value}")
+            elif col_lower == 'reason':
+                # Truncate long reasons
+                reason_text = str(value)[:50] + "..." if value and len(str(value)) > 50 else value
+                line_parts.append(f"Reason: {reason_text}")
+            elif col_lower == 'empph':
+                line_parts.append(f"Phone: {value}")
+            else:
+                line_parts.append(f"{col}: {value}")
+        
+        # Join all parts
+        formatted_lines.append("• " + " - ".join(str(p) for p in line_parts if p))
+    
+    return "\n".join(formatted_lines)
+
+    
 # --------------------- NATURAL LANGUAGE VERBALIZATION ---------------------
 
-def verbalize_results(tokenizer, model, user_question: str, cols: list, rows: list, intent: str) -> str:
+def verbalize_results(tokenizer, model, user_question: str, cols: list, rows: list, intent: str, page_size: int = 3, page_num: int = 1) -> str:
     """
-    Convert SQL query results into natural language using Llama 3.1 8B
+    Convert SQL query results into natural language using Llama 3.1 8B with pagination
     """
     if not rows:
         return "No results found for your query."
     
+    # Special handling for single-column, single-value results
+    if len(cols) == 1 and len(rows) == 1:
+        col_name = cols[0]
+        value = rows[0][0]
+        
+        # Handle COUNT queries
+        if 'COUNT' in col_name.upper():
+            q_lower = user_question.lower()
+            if 'how many' in q_lower or 'count' in q_lower:
+                entity = 'employees'
+                if 'leaves' in q_lower or 'applications' in q_lower:
+                    entity = 'leave applications'
+                return f"{value} {entity} match your criteria."
+        
+        # Extract email from question if present
+        email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
+        email_match = re.search(email_pattern, user_question)
+        
+        if col_name.lower() in ['empph', 'phone', 'contact']:
+            if email_match:
+                return f"The phone number for {email_match.group()} is: {value}"
+            else:
+                return f"The phone number is: {value}"
+        elif col_name.lower() in ['cl', 'sl', 'co']:
+            return f"The {col_name.upper()} balance is: {value}"
+    
+    # Calculate pagination
+    total_rows = len(rows)
+    start_idx = (page_num - 1) * page_size
+    end_idx = min(start_idx + page_size, total_rows)
+    paginated_rows = rows[start_idx:end_idx]
+    
     # Format data for the model
-    data_summary = format_data_for_verbalization(cols, rows)
-    estimated_tokens = len(rows) * 70 + 300
-    max_tokens = min(estimated_tokens, 4000)
-    system_prompt = """You are a data presenter that converts database results into readable text.
+    data_summary = format_data_for_verbalization(cols, paginated_rows, page_num, start_idx)
+    
+    # With only 3-5 rows, we can use more tokens per row
+    estimated_tokens = len(paginated_rows) * 150 + 300  # ✅ More generous estimate
+    max_tokens = min(estimated_tokens, 1500)  # ✅ Lower ceiling since fewer rows
+    
+    system_prompt = """You are a helpful assistant that converts database query results into natural, human-readable responses.
 
-CRITICAL RULES:
-1. Use EXACT data from the results - DO NOT modify, summarize, or change any values
-2. Employee names MUST be copied EXACTLY as shown in the data
-3. Dates MUST be copied EXACTLY as shown (do not reformat)
-4. Email addresses MUST be copied EXACTLY
-5. Numbers MUST be copied EXACTLY
-6. DO NOT make assumptions or infer information not present in the data
-7. DO NOT truncate or abbreviate names
-8. DO NOT change the order of information
+Your task:
+1. Analyze the user's question and the data provided
+2. Generate a clear, conversational response that answers the question
+3. Present information in a natural way, avoiding technical jargon
+4. Use proper formatting with bullet points for multiple items
+5. Be concise but complete
 
-Format guidelines:
-- For single results: Present the information clearly
-- For multiple results: Use bullet points with "•" 
-- Start each bullet with the employee name EXACTLY as shown
-- Include all relevant details from each row
+**CRITICAL PAGINATION RULE:**
+- You have been given a SMALL subset of results (typically 3-5 rows)
+- You MUST include ALL rows provided in your response
+- Each row must have its own bullet point
+- Do NOT skip any rows
 
-Example (FOLLOW THIS FORMAT EXACTLY):
+Guidelines:
+- For single results: Give a direct answer
+- For multiple results: List them clearly with relevant details (ONE bullet per row)
+- For counts: State the number naturally
+- For dates: Format them in a readable way (e.g., "from November 1st to November 5th")
+- Always include employee names when available
+- For leave balances: Mention Casual Leave (CL), Sick Leave (SL), and Comp Off (CO) clearly
+
+Examples:
 Question: "Who is on leave today?"
-Columns: empname, empemail, from, to, leavetype, reason
-Row 1: empname: SUDHANSU SEKHAR SINGH, empemail: sudhansu@example.com, from: 2025-11-10, to: 2025-11-13, leavetype: CASUAL LEAVE, reason: Personal work
+Data: [['John Doe', 'john@example.com', '2025-11-10', '2025-11-12', 'SICK LEAVE']]
+Response: "John Doe (john@example.com) is currently on sick leave from November 10th to November 12th, 2025."
 
-Response:
-Based on the data, here are the employees on leave today:
+Question: "show employees with sick leave > 5"
+Data: 
+Row 1: empname: John, empemail: john@ex.com, sl: 18
+Row 2: empname: Jane, empemail: jane@ex.com, sl: 12
+Row 3: empname: Bob, empemail: bob@ex.com, sl: 8
+Response: "Here are employees with sick leave balance greater than 5:
 
-• SUDHANSU SEKHAR SINGH (sudhansu@example.com) is on CASUAL LEAVE from 2025-11-10 to 2025-11-13. Reason: Personal work
+- John (john@ex.com) with 18 days of sick leave
+- Jane (jane@ex.com) with 12 days of sick leave
+- Bob (bob@ex.com) with 8 days of sick leave"
 
-Now convert the following data:"""
+Now convert the following data into a natural response:"""
 
     user_message = f"""Question: {user_question}
 
 {data_summary}
 
-IMPORTANT: Copy names and data EXACTLY as shown above. Do not modify any values."""
+IMPORTANT: Include ALL {len(paginated_rows)} rows in your response. Each row should have its own bullet point."""
 
     messages = [
         {"role": "system", "content": system_prompt},
@@ -709,9 +839,9 @@ IMPORTANT: Copy names and data EXACTLY as shown above. Do not modify any values.
         out = model.generate(
             **inputs,
             max_new_tokens=max_tokens,
-            do_sample=False,  # Changed from True to False for more deterministic output
-            temperature=0.1,   # Changed from 0.7 to 0.1 for less creativity
-            top_p=0.95,        # Changed from 0.9
+            do_sample=False,
+            temperature=0.1,
+            top_p=0.95,
             pad_token_id=tokenizer.pad_token_id,
             eos_token_id=tokenizer.eos_token_id,
         )
@@ -722,21 +852,27 @@ IMPORTANT: Copy names and data EXACTLY as shown above. Do not modify any values.
     # Clean up any artifacts from generation
     response = re.sub(r"^(Response:|Answer:|A:)\s*", "", response, flags=re.IGNORECASE).strip()
     
-    if len(rows) > 20:
-        response += f"\n\n... and {len(rows) - 20} more employees (showing first 20 results)"
-
+    # Add pagination info
+    remaining = total_rows - end_idx
+    if remaining > 0:
+        response += f"\n\n📄 Showing results {start_idx + 1}-{end_idx} of {total_rows}. ({remaining} more remaining - type 'more' or 'next')"
+    else:
+        if total_rows > page_size:
+            response += f"\n\n✓ Showing all {total_rows} results (page {page_num}/{(total_rows + page_size - 1) // page_size})."
+    
     return response
-def format_data_for_verbalization(cols: list, rows: list, max_rows: int = 20) -> str:  # Reduced from 50 to 20
+
+    
+def format_data_for_verbalization(cols: list, rows: list, page_num: int = 1, start_idx: int = 0) -> str:
     """
     Format query results into a readable string for the LLM
     """
     if not rows:
         return "No data"
-    limited_rows = rows[:max_rows]
     
     formatted_lines = [f"Columns: {', '.join(cols)}\n"]
     
-    for i, row in enumerate(limited_rows, 1):
+    for i, row in enumerate(rows, start=start_idx + 1):
         row_data = []
         for col, val in zip(cols, row):
             if val is not None:
@@ -745,53 +881,64 @@ def format_data_for_verbalization(cols: list, rows: list, max_rows: int = 20) ->
                 row_data.append(f"{col}: NULL")
         formatted_lines.append(f"Row {i}: {', '.join(row_data)}")
     
-    if len(rows) > max_rows:
-        formatted_lines.append(f"\n... and {len(rows) - max_rows} more rows (not shown in verbalization)")
-    
     return "\n".join(formatted_lines)
-# def format_data_for_verbalization(cols: list, rows: list, max_rows: int = 50) -> str:
-#     """
-#     Format query results into a readable string for the LLM
-#     """
-#     if not rows:
-#         return "No data"
+
+# --------------------- PAGINATION STATE MANAGER ---------------------
+
+class PaginationState:
+    def __init__(self):
+        self.last_query = None
+        self.last_cols = None
+        self.last_rows = None
+        self.last_intent = None
+        self.last_question = None
+        self.current_page = 1
+        self.page_size = 3
     
-#     # Limit rows to avoid context overflow
-#     limited_rows = rows[:max_rows]
+    def set_results(self, query, cols, rows, intent, question):
+        self.last_query = query
+        self.last_cols = cols
+        self.last_rows = rows
+        self.last_intent = intent
+        self.last_question = question
+        self.current_page = 1
     
-#     # Add column headers explicitly
-#     formatted_lines = [f"Columns: {', '.join(cols)}\n"]
+    def next_page(self):
+        if self.last_rows:
+            max_page = (len(self.last_rows) + self.page_size - 1) // self.page_size
+            if self.current_page < max_page:
+                self.current_page += 1
+                return True
+        return False
     
-#     for i, row in enumerate(limited_rows, 1):
-#         row_data = []
-#         for col, val in zip(cols, row):
-#             # Make it very explicit what each value is
-#             if val is not None:
-#                 row_data.append(f"{col}: {val}")
-#             else:
-#                 row_data.append(f"{col}: NULL")
-#         formatted_lines.append(f"Row {i}: {', '.join(row_data)}")
+    def has_data(self):
+        return self.last_rows is not None and len(self.last_rows) > 0
     
-#     if len(rows) > max_rows:
-#         formatted_lines.append(f"\n... and {len(rows) - max_rows} more rows (not shown)")
-    
-#     return "\n".join(formatted_lines)
+    def reset(self):
+        self.last_query = None
+        self.last_cols = None
+        self.last_rows = None
+        self.last_intent = None
+        self.last_question = None
+        self.current_page = 1
 
 # --------------------- MAIN ---------------------
 
 def main():
     print("="*60)
-    print("LLAMA 3.1 8B LEAVE CHATBOT v4.0 - WITH NL VERBALIZATION")
+    print("LLAMA 3.1 8B LEAVE CHATBOT v5.0 - WITH PAGINATION")
     print("="*60)
     
     tokenizer, model = load_model()
     print("✓ Llama 3.1 8B ready")
     
     intent_detector = IntentDetector()
+    pagination_state = PaginationState()
     
     conn = get_db()
     print("✓ DB connected\n")
-    print("Type 'quit' to exit\n")
+    print("Type 'quit' to exit")
+    print("Type 'more' or 'next' to see more results\n")
     
     while True:
         try:
@@ -803,24 +950,56 @@ def main():
                 continue
             
             conn = ensure_connection(conn)
+            # Check if user wants to see more results
+            if q.lower() in ['more', 'next', 'show more', 'continue']:
+                if not pagination_state.has_data():
+                    print(" No previous query results to show more of. Please ask a new question.\n")
+                    continue
+                
+                if not pagination_state.next_page():
+                    print(" You've reached the end of the results.\n")
+                    continue
+                
+                # Generate response for next page
+                print(f"\n Loading page {pagination_state.current_page}...")
+                nl_response = verbalize_results(
+                    tokenizer, model,
+                    pagination_state.last_question,
+                    pagination_state.last_cols,
+                    pagination_state.last_rows,
+                    pagination_state.last_intent,
+                    page_size=pagination_state.page_size,
+                    page_num=pagination_state.current_page
+                )
+                
+                print("\n" + "="*60)
+                print("ANSWER:")
+                print("="*60)
+                print(nl_response)
+                print("="*60 + "\n")
+                continue
+            
+            # Reset pagination for new query
+            pagination_state.reset()
             
             # Preprocess dates
             original_q = q
+            print(q)
             q, date_context = preprocess_question(q)
             if date_context:
-                print(f"📅 {date_context}")
+                print(f" {date_context}")
             if q != original_q:
-                print(f"🔄 Preprocessed: {q}")
+                print(f" Preprocessed: {q}")
             
             # Detect intent
             intent, confidence = intent_detector.detect(q)
-            print(f"🎯 Intent: {intent} (confidence: {confidence:.2f})")
+            print(f" Intent: {intent} (confidence: {confidence:.2f})")
             
             # Analyze context
             context = analyze_query_context(q)
-            print(f"🔍 Query scope: {context['query_scope']}")
+            print(f" Query scope: {context['query_scope']}")
             if context['leave_type']:
-                print(f"📋 Leave type detected: {context['leave_type']}")
+                print(f" Leave type detected: {context['leave_type']}")
             
             # Get schema
             schema = get_schema_for_intent(intent)
@@ -829,30 +1008,33 @@ def main():
             messages = build_llama_prompt(q, intent, context)
             
             # Generate SQL
-            print("⚙  Generating SQL...")
+            print(" Generating SQL...")
             raw_sql = generate_sql(tokenizer, model, messages)
-            print(f"\n📝 Generated SQL:\n{raw_sql}\n")
+            print(f"\n Generated SQL:\n{raw_sql}\n")
             
             # Validate and auto-repair
-            print("✓ Validating SQL...")
+            print(" Validating SQL...")
             final_sql, is_valid, attempts = validate_and_repair_sql(
                 conn, raw_sql, tokenizer, model, schema, q, intent, max_attempts=3
             )
             
             if is_valid:
-                print(f"✅ SQL validated (took {attempts} attempt(s))")
+                print(f" SQL validated (took {attempts} attempt(s))")
             else:
-                print(f"⚠  Validation failed after {attempts} attempts, trying execution...")
+                print(f" Validation failed after {attempts} attempts, trying execution...")
             
             # Execute
-            print("\n🔄 Executing query...")
+            print("\nExecuting query...")
             cols, rows = run_query(conn, final_sql)
+            
+            # Store results for pagination
+            pagination_state.set_results(final_sql, cols, rows, intent, original_q)
             
             # Display raw results (optional - can be commented out)
             if not rows:
-                print("❌ No results found")
+                print(" No results found")
             else:
-                print(f"\n📊 Raw Results ({len(rows)} rows):")
+                print(f"\n Raw Results ({len(rows)} rows):")
                 print("-" * 60)
                 
                 col_widths = [max(len(str(c)), max(len(str(row[i])) for row in rows[:5])) for i, c in enumerate(cols)]
@@ -868,12 +1050,16 @@ def main():
                 if len(rows) > 5:
                     print(f"  ... and {len(rows)-5} more rows")
             
-            # Generate natural language response
+            # Generate natural language response with pagination
             print("\n💭 Generating natural language response...")
-            nl_response = verbalize_results(tokenizer, model, original_q, cols, rows, intent)
+            nl_response = verbalize_results(
+                tokenizer, model, original_q, cols, rows, intent,
+                page_size=pagination_state.page_size,
+                page_num=pagination_state.current_page
+            )
             
             print("\n" + "="*60)
-            print("🤖 ANSWER:")
+            print(" ANSWER:")
             print("="*60)
             print(nl_response)
             print("="*60 + "\n")
@@ -882,13 +1068,13 @@ def main():
             print("\n\n⚠  Interrupted")
             break
         except Exception as e:
-            print(f"❌ Error: {e}")
+            print(f" Error: {e}")
     
     try:
         conn.close()
     except:
         pass
-    print("\n👋 Goodbye!")
-
+    print("\n Goodbye!")
+    
 if __name__ == "__main__":
     main()
