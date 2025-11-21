@@ -140,7 +140,7 @@ def preprocess_question(question: str) -> tuple:
     
     return question, date_context
 
-# --------------------- INTENT DETECTION (Same as original) ---------------------
+# --------------------- INTENT DETECTION (Enhanced) ---------------------
 
 class IntentDetector:
     def __init__(self):
@@ -171,18 +171,25 @@ class IntentDetector:
                 "from date", "to date", "leave period", "leave duration",
                 "first leave", "when took", "leave type", "longest leave",
                 "most leaves", "top employees", "how many members", "maximum",
-                "sick leave", "casual leave", "comp off"
+                "sick leave", "casual leave", "comp off",
+                # ADDED: Enhanced aggregation examples
+                "more than 3 days", "more than 5 days", "took more leaves",
+                "more number of leaves", "took leaves more than", "exceeded leaves",
+                "maximum leaves", "most leave days", "highest leave count",
+                "employees with most leaves", "who took more", "top leave takers",
+                "more leaves", "most number of leaves", "highest number of leaves",
+                "employees took more leaves", "who took maximum leaves"
             ]
         }
         
         self.intent_embeds = {
-            k: self.model.encode(v)  # Removed convert_to_tensors parameter
+            k: self.model.encode(v)
             for k, v in self.intent_examples.items()
         }
         print("Intent detector ready")
     
     def detect(self, question: str):
-        q_emb = self.model.encode(question)  # Removed convert_to_tensors parameter
+        q_emb = self.model.encode(question)
         
         scores = {
             intent: float(util.cos_sim(q_emb, emb).max()) 
@@ -201,7 +208,7 @@ class IntentDetector:
         
         return best_intent, best_score
 
-# --------------------- CONTEXT ANALYSIS (Same as original) ---------------------
+# --------------------- CONTEXT ANALYSIS (Enhanced) ---------------------
 
 def analyze_query_context(question: str) -> dict:
     q_lower = question.lower()
@@ -210,7 +217,11 @@ def analyze_query_context(question: str) -> dict:
         'email': None,
         'is_general_query': False,
         'query_scope': 'unknown',
-        'leave_type': None
+        'leave_type': None,
+        'requires_aggregation': False,
+        'aggregation_type': None,  # NEW: 'count', 'sum_days', 'duration'
+        'min_days_threshold': None,
+        'is_top_employees_query': False
     }
 
     specific_leave_keywords = ['casual leave', 'sick leave', 'comp off', 
@@ -239,7 +250,7 @@ def analyze_query_context(question: str) -> dict:
     
     if not context['has_specific_email']:
         question_indicators = ['who', 'which', 'what', 'how many', 'list', 'show', 'give', 'top']
-        person_plurals = ['employees', 'members', 'people', 'persons', 'staff']
+        person_plurals = ['employees', 'members', 'people', 'persons', 'staff', 'names']
         quantifiers = ['all', 'any', 'every', 'everyone', 'anyone', 'maximum', 'most']
         
         has_question_word = any(word in q_lower for word in question_indicators)
@@ -252,9 +263,50 @@ def analyze_query_context(question: str) -> dict:
         else:
             context['query_scope'] = 'unclear'
     
+    # NEW: More flexible aggregation detection
+    # Detect if query is about counting/summing leaves
+    aggregation_patterns = {
+        'sum_days': [
+            'more than', 'greater than', 'over', 'exceeding', 'above',
+            'less than', 'below', 'under', 'fewer than',
+            'most leaves', 'more leaves', 'maximum leaves', 'highest',
+            'least leaves', 'minimum leaves', 'lowest', 'fewest',
+            'took more', 'took most', 'took less', 'took least',
+            'total days', 'sum of', 'number of days'
+        ],
+        'count': [
+            'how many', 'count', 'number of employees', 'number of members',
+            'how many employees', 'how many members', 'total employees'
+        ],
+        'top_ranking': [
+            'top', 'top 5', 'top 10', 'first', 'highest', 'maximum',
+            'most', 'best', 'leading'
+        ]
+    }
+    
+    # Check if query requires aggregation
+    for agg_type, keywords in aggregation_patterns.items():
+        if any(keyword in q_lower for keyword in keywords):
+            context['requires_aggregation'] = True
+            context['aggregation_type'] = agg_type
+            context['is_general_query'] = True
+            context['query_scope'] = 'all_employees'
+            break
+    
+    # Extract numeric thresholds for days
+    days_match = re.search(r'(\d+)\s*days?', q_lower)
+    if days_match:
+        context['min_days_threshold'] = int(days_match.group(1))
+    
+    # Detect top N queries
+    top_match = re.search(r'top\s+(\d+)\s+(employees|members)', q_lower)
+    if top_match:
+        context['is_top_employees_query'] = True
+        context['top_limit'] = int(top_match.group(1))
+    
     return context
 
-# --------------------- QUICK SYNTAX FIXES (Same as original) ---------------------
+# --------------------- QUICK SYNTAX FIXES (Enhanced) ---------------------
 
 def quick_syntax_fix(sql: str) -> str:
     # Remove NULLS FIRST/LAST (not supported in MySQL)
@@ -323,6 +375,14 @@ def quick_syntax_fix(sql: str) -> str:
             flags=re.IGNORECASE
         )
     
+    # Fix SUM(DATEDIFF()) patterns if needed
+    sql = re.sub(
+        r'SUM\s*\(\s*DATEDIFF\s*\(\s*`to`\s*,\s*`from`\s*\)\s*\+\s*1\s*\)',
+        'SUM(DATEDIFF(`to`, `from`) + 1)',
+        sql,
+        flags=re.IGNORECASE
+    )
+    
     # ✅ REMOVED: The problematic CAST conversion for WHERE clauses
     # This was causing the syntax error by converting too many patterns
     
@@ -340,7 +400,8 @@ def quick_syntax_fix(sql: str) -> str:
         sql = re.sub(r'SELECT\s+empph', 'SELECT DISTINCT empph', sql, flags=re.IGNORECASE)
     
     return sql
-# --------------------- SCHEMA TEMPLATES (Same as original) ---------------------
+
+# --------------------- SCHEMA TEMPLATES (Enhanced) ---------------------
 
 SCHEMA_TEMPLATES = {
     "leavebalance": """
@@ -392,6 +453,28 @@ CRITICAL DATE QUERY RULES:
 - For phone: SELECT DISTINCT empph LIMIT 1
 - Column is 'leavetype' NOT 'ltype'
 - Use LOWER(leavetype) LIKE '%keyword%' for case-insensitive matching
+
+**CRITICAL: TOTAL LEAVE DAYS CALCULATION**
+When user asks about employees who took "more than X days" OR "more leaves" OR "most leaves":
+1. Calculate TOTAL days per employee: SUM(DATEDIFF(`to`, `from`) + 1)
+2. Group by empname, empemail
+3. Use HAVING clause to filter: HAVING SUM(DATEDIFF(`to`, `from`) + 1) > X
+4. Order by total days DESC for rankings
+5. ALWAYS include the calculated total in SELECT as 'total_days'
+
+EXAMPLES:
+- "employees who took more than 5 days this month" → 
+  SELECT empname, empemail, SUM(DATEDIFF(`to`, `from`) + 1) AS total_days 
+  FROM leaves WHERE `from` >= '2025-11-01' 
+  GROUP BY empname, empemail 
+  HAVING total_days > 5 
+  ORDER BY total_days DESC
+
+- "top 5 employees with most leaves this month" →
+  SELECT empname, empemail, COUNT(*) AS leave_count, SUM(DATEDIFF(`to`, `from`) + 1) AS total_days 
+  FROM leaves WHERE `from` >= '2025-11-01' 
+  GROUP BY empname, empemail 
+  ORDER BY total_days DESC LIMIT 5
 """
 }
 
@@ -407,7 +490,7 @@ def get_schema_for_intent(intent: str, original_question: str = "") -> str:
     else:
         return SCHEMA_TEMPLATES["leavebalance"] + "\n" + SCHEMA_TEMPLATES["leaves"]
 
-# --------------------- LLAMA 3.1 PROMPT BUILDING (Same as original) ---------------------
+# --------------------- LLAMA 3.1 PROMPT BUILDING (Enhanced) ---------------------
 
 def build_llama_prompt(user_question: str, intent: str, context: dict) -> str:
     schema = get_schema_for_intent(intent)
@@ -437,8 +520,102 @@ Include empname, empemail, cl, sl, co, total_balance in SELECT."""
             intent_hint = "TASK: Check if employee can apply for specified leave type by verifying balance > 0"
         else:
             intent_hint = "TASK: Query 'leavebalance' table. Return cl, sl, co values."
+    
     elif intent == "leaves":
-        if any(word in q_lower for word in ['latest', 'recent', 'last']):
+        # NEW: Unified aggregation handling
+        if context.get('requires_aggregation', False):
+            # Extract numeric thresholds
+            days_threshold = context.get('min_days_threshold')
+            
+            top_match = re.search(r'top\s*(\d+)', q_lower)
+            limit_count = top_match.group(1) if top_match else '5'
+            
+            # Determine aggregation type
+            agg_type = context.get('aggregation_type', 'sum_days')
+            
+            # Build appropriate hint based on query intent
+            if agg_type == 'count':
+                # User wants COUNT of employees
+                if days_threshold:
+                    intent_hint = f"""TASK: COUNT how many employees took more than {days_threshold} total days.
+Structure: SELECT COUNT(*) FROM (subquery with GROUP BY and HAVING)
+SELECT COUNT(*) FROM (
+    SELECT empemail FROM leaves 
+    WHERE [date filter]
+    GROUP BY empemail 
+    HAVING SUM(DATEDIFF(`to`, `from`) + 1) > {days_threshold}
+) AS subquery;"""
+                else:
+                    intent_hint = """TASK: COUNT employees who took leaves.
+Use COUNT(DISTINCT empemail) or subquery with GROUP BY."""
+            
+            elif agg_type == 'top_ranking' or 'top' in q_lower:
+                # User wants top N employees
+                intent_hint = f"""TASK: Find top {limit_count} employees with MOST total leave days.
+CRITICAL RULES:
+1. Calculate TOTAL days per employee: SUM(DATEDIFF(`to`, `from`) + 1)
+2. Include both leave_count and total_days
+3. GROUP BY empname, empemail
+4. ORDER BY total_days DESC (NOT leave_count)
+5. LIMIT {limit_count}
+
+Structure:
+SELECT empname, empemail, COUNT(*) AS leave_count, SUM(DATEDIFF(`to`, `from`) + 1) AS total_days
+FROM leaves
+WHERE [date filter if specified]
+GROUP BY empname, empemail
+ORDER BY total_days DESC
+LIMIT {limit_count};"""
+            
+            else:
+                # Default: sum_days type (most common case)
+                comparison_operators = {
+                    'more than': '>', 'greater than': '>', 'over': '>', 'above': '>',
+                    'less than': '<', 'below': '<', 'under': '<', 'fewer than': '<'
+                }
+                
+                operator = '>'  # default
+                for phrase, op in comparison_operators.items():
+                    if phrase in q_lower:
+                        operator = op
+                        break
+                
+                if days_threshold:
+                    intent_hint = f"""TASK: Find employees who took {operator} {days_threshold} TOTAL days of leave.
+CRITICAL RULES:
+1. Calculate TOTAL days across ALL leave applications per employee
+2. Use SUM(DATEDIFF(`to`, `from`) + 1) AS total_days
+3. GROUP BY empname, empemail
+4. Use HAVING clause: HAVING total_days {operator} {days_threshold}
+5. ORDER BY total_days DESC
+6. Include total_days in SELECT
+
+Structure:
+SELECT empname, empemail, SUM(DATEDIFF(`to`, `from`) + 1) AS total_days
+FROM leaves
+WHERE [date filter if specified]
+GROUP BY empname, empemail
+HAVING total_days {operator} {days_threshold}
+ORDER BY total_days DESC;"""
+                else:
+                    # Generic "most leaves" or "more leaves" without specific threshold
+                    intent_hint = """TASK: Find employees with MOST total leave days (no specific threshold).
+CRITICAL RULES:
+1. Calculate TOTAL days: SUM(DATEDIFF(`to`, `from`) + 1) AS total_days
+2. Include COUNT(*) AS leave_count to show number of applications
+3. GROUP BY empname, empemail
+4. ORDER BY total_days DESC (this shows who took most)
+5. DO NOT use LIMIT unless specifically asked for "top N"
+
+Structure:
+SELECT empname, empemail, COUNT(*) AS leave_count, SUM(DATEDIFF(`to`, `from`) + 1) AS total_days
+FROM leaves
+WHERE [date filter if specified]
+GROUP BY empname, empemail
+ORDER BY total_days DESC;"""
+        
+        # Existing non-aggregation handlers
+        elif any(word in q_lower for word in ['latest', 'recent', 'last']):
             leave_type_filter = ""
             if context['leave_type']:
                 leave_type_filter = f" AND LOWER(leavetype) LIKE '%{context['leave_type'].split()[0].lower()}%'"
@@ -447,10 +624,13 @@ Include empname, empemail, cl, sl, co, total_balance in SELECT."""
                 intent_hint = f"TASK: Use 'leaves' table. Find most recent leave{leave_type_filter} for {context['email']}. ORDER BY `from` DESC LIMIT 1. Show `from`, `to`, leavetype, reason."
             else:
                 intent_hint = f"TASK: Use 'leaves' table. Find most recent leave{leave_type_filter} across ALL employees (no email filter). ORDER BY `from` DESC LIMIT 1. Show empname, empemail, `from`, `to`, leavetype."
+        
         elif any(word in q_lower for word in ['duration', 'how many days', 'how long']):
             intent_hint = "TASK: Calculate duration using DATEDIFF(`to`, `from`) + 1"
+        
         elif "phone" in q_lower or "contact" in q_lower:
             intent_hint = "TASK: SELECT DISTINCT empph (phone number) from leaves table LIMIT 1"
+        
         elif any(word in q_lower for word in ['on leave', 'who is on leave', 'members on leave']):
             date_pattern = r"on\s+'([\d-]+)'"
             date_match = re.search(date_pattern, user_question)
@@ -459,6 +639,7 @@ Include empname, empemail, cl, sl, co, total_balance in SELECT."""
                 intent_hint = f"TASK: Find employees on leave on {specific_date}. WHERE '{specific_date}' BETWEEN `from` AND `to`. DO NOT use CURDATE()."
             else:
                 intent_hint = "TASK: Find employees currently on leave. WHERE CURDATE() BETWEEN `from` AND `to`"
+        
         elif any(word in q_lower for word in ['top', 'most', 'maximum']):
             intent_hint = "TASK: GROUP BY empemail, COUNT leaves, ORDER BY count DESC, use LIMIT"
     
@@ -536,6 +717,53 @@ A: SELECT empname, empemail, COUNT(*) AS leave_count FROM leaves GROUP BY empnam
 
 Q: "phone number of john@example.com"
 A: SELECT DISTINCT empph FROM leaves WHERE empemail = 'john@example.com' LIMIT 1;
+
+**NEW AGGREGATION EXAMPLES (TOTAL DAYS CALCULATION):**
+
+Q: "give me the list of employees who took more than 5 days in this month"
+A: SELECT empname, empemail, SUM(DATEDIFF(`to`, `from`) + 1) AS total_days FROM leaves WHERE `from` >= DATE_FORMAT(CURDATE(), '%Y-%m-01') GROUP BY empname, empemail HAVING total_days > 5 ORDER BY total_days DESC;
+
+Q: "employees who took more leaves in this month"
+A: SELECT empname, empemail, COUNT(*) AS leave_count, SUM(DATEDIFF(`to`, `from`) + 1) AS total_days FROM leaves WHERE `from` >= DATE_FORMAT(CURDATE(), '%Y-%m-01') GROUP BY empname, empemail ORDER BY total_days DESC;
+
+Q: "give me the employee names who took leaves more leaves in this month"
+A: SELECT empname, empemail, COUNT(*) AS leave_count, SUM(DATEDIFF(`to`, `from`) + 1) AS total_days FROM leaves WHERE `from` >= DATE_FORMAT(CURDATE(), '%Y-%m-01') GROUP BY empname, empemail ORDER BY total_days DESC;
+
+Q: "employee names who took more leaves this month"
+A: SELECT empname, empemail, COUNT(*) AS leave_count, SUM(DATEDIFF(`to`, `from`) + 1) AS total_days FROM leaves WHERE `from` >= DATE_FORMAT(CURDATE(), '%Y-%m-01') GROUP BY empname, empemail ORDER BY total_days DESC;
+
+Q: "list employees took most leaves this month"
+A: SELECT empname, empemail, COUNT(*) AS leave_count, SUM(DATEDIFF(`to`, `from`) + 1) AS total_days FROM leaves WHERE `from` >= DATE_FORMAT(CURDATE(), '%Y-%m-01') GROUP BY empname, empemail ORDER BY total_days DESC;
+
+Q: "show me employees with maximum leaves this month"
+A: SELECT empname, empemail, COUNT(*) AS leave_count, SUM(DATEDIFF(`to`, `from`) + 1) AS total_days FROM leaves WHERE `from` >= DATE_FORMAT(CURDATE(), '%Y-%m-01') GROUP BY empname, empemail ORDER BY total_days DESC;
+
+Q: "who took highest number of leaves this month"
+A: SELECT empname, empemail, COUNT(*) AS leave_count, SUM(DATEDIFF(`to`, `from`) + 1) AS total_days FROM leaves WHERE `from` >= DATE_FORMAT(CURDATE(), '%Y-%m-01') GROUP BY empname, empemail ORDER BY total_days DESC LIMIT 1;
+
+Q: "how many members took leave more than 3 days in this month"
+A: SELECT COUNT(*) FROM (SELECT empemail FROM leaves WHERE `from` >= DATE_FORMAT(CURDATE(), '%Y-%m-01') GROUP BY empemail HAVING SUM(DATEDIFF(`to`, `from`) + 1) > 3) AS subquery;
+
+Q: "top 5 employees who took most leaves this month"
+A: SELECT empname, empemail, COUNT(*) AS leave_count, SUM(DATEDIFF(`to`, `from`) + 1) AS total_days FROM leaves WHERE `from` >= DATE_FORMAT(CURDATE(), '%Y-%m-01') GROUP BY empname, empemail ORDER BY total_days DESC LIMIT 5;
+
+Q: "give me employee records who took leave more than 3 days in this month"
+A: SELECT empname, empemail, SUM(DATEDIFF(`to`, `from`) + 1) AS total_days FROM leaves WHERE `from` >= DATE_FORMAT(CURDATE(), '%Y-%m-01') GROUP BY empname, empemail HAVING total_days > 3 ORDER BY total_days DESC;
+
+Q: "list of employees who took more number of leaves in this month"
+A: SELECT empname, empemail, COUNT(*) AS leave_count, SUM(DATEDIFF(`to`, `from`) + 1) AS total_days FROM leaves WHERE `from` >= DATE_FORMAT(CURDATE(), '%Y-%m-01') GROUP BY empname, empemail ORDER BY total_days DESC;
+
+Q: "give me employee names who took leaves more than 3 days in this month"
+A: SELECT empname, empemail, SUM(DATEDIFF(`to`, `from`) + 1) AS total_days FROM leaves WHERE `from` >= DATE_FORMAT(CURDATE(), '%Y-%m-01') GROUP BY empname, empemail HAVING total_days > 3 ORDER BY total_days DESC;
+
+Q: "employees who took more than 5 days last month"
+A: SELECT empname, empemail, SUM(DATEDIFF(`to`, `from`) + 1) AS total_days FROM leaves WHERE `from` >= DATE_FORMAT(DATE_SUB(CURDATE(), INTERVAL 1 MONTH), '%Y-%m-01') AND `from` < DATE_FORMAT(CURDATE(), '%Y-%m-01') GROUP BY empname, empemail HAVING total_days > 5 ORDER BY total_days DESC;
+
+Q: "top 3 employees with most leaves this year"
+A: SELECT empname, empemail, COUNT(*) AS leave_count, SUM(DATEDIFF(`to`, `from`) + 1) AS total_days FROM leaves WHERE YEAR(`from`) = YEAR(CURDATE()) GROUP BY empname, empemail ORDER BY total_days DESC LIMIT 3;
+
+Q: "employees who took more leaves last 30 days"
+A: SELECT empname, empemail, COUNT(*) AS leave_count, SUM(DATEDIFF(`to`, `from`) + 1) AS total_days FROM leaves WHERE `from` >= DATE_SUB(CURDATE(), INTERVAL 30 DAY) GROUP BY empname, empemail ORDER BY total_days DESC;
 
 CRITICAL DATE RANGE RULES:
 1. When asked for "leave records between DATE1 and DATE2" OR "last month records" OR "records from DATE1 to DATE2":
