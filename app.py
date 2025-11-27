@@ -91,54 +91,85 @@ def load_model():
 
 # --------------------- DATE PREPROCESSING (Same as original) ---------------------
 
+# --------------------- DATE PREPROCESSING (FIXED: this month -> end of month) ---------------------
+import calendar
+
 def preprocess_question(question: str) -> tuple:
+    """
+    Returns: (rewritten_question, date_context, period_start, period_end)
+    period_start/period_end are strings 'YYYY-MM-DD' when a period is detected, else None.
+    """
     q_lower = question.lower()
     today = datetime.date.today()
     date_context = ""
-    
-    if "last month" in q_lower:
-        last_month_start = (today.replace(day=1) - datetime.timedelta(days=1)).replace(day=1)
-        last_month_end = today.replace(day=1) - datetime.timedelta(days=1)
-        date_context = f"Date range: {last_month_start} to {last_month_end}"
-        question = question.replace("last month", f"between '{last_month_start}' and '{last_month_end}'")
-    
-    elif "last 30 days" in q_lower or "past 30 days" in q_lower:
-        date_30_days_ago = today - datetime.timedelta(days=30)
-        date_context = f"Date range: {date_30_days_ago} to {today}"
-        question = question.replace("last 30 days", f"after '{date_30_days_ago}'")
-        question = question.replace("past 30 days", f"after '{date_30_days_ago}'")
-    
-    elif "this month" in q_lower:
-        month_start = today.replace(day=1)
-        date_context = f"Date range: {month_start} to {today}"
-        question = question.replace("this month", f"from '{month_start}'")
-    
-    elif "this year" in q_lower:
-        year_start = today.replace(month=1, day=1)
-        date_context = f"Date range: {year_start} to {today}"
-        question = question.replace("this year", f"after '{year_start}'")
+    period_start = None
+    period_end = None
 
+    def month_start_end(year: int, month: int):
+        start = datetime.date(year, month, 1)
+        last_day = calendar.monthrange(year, month)[1]
+        end = datetime.date(year, month, last_day)
+        return start, end
+
+    # LAST MONTH
+    if "last month" in q_lower:
+        last_month = (today.replace(day=1) - datetime.timedelta(days=1))
+        s, e = month_start_end(last_month.year, last_month.month)
+        period_start, period_end = s.isoformat(), e.isoformat()
+        date_context = f"Date range: {period_start} to {period_end}"
+        question = question.replace("last month", f"between '{period_start}' and '{period_end}'")
+
+    # PAST/LAST 30 DAYS
+    elif "last 30 days" in q_lower or "past 30 days" in q_lower:
+        s = today - datetime.timedelta(days=30)
+        e = today
+        period_start, period_end = s.isoformat(), e.isoformat()
+        date_context = f"Date range: {period_start} to {period_end}"
+        question = question.replace("last 30 days", f"after '{period_start}'")
+        question = question.replace("past 30 days", f"after '{period_start}'")
+
+    # THIS MONTH (fix: use last calendar day)
+    elif "this month" in q_lower:
+        s, e = month_start_end(today.year, today.month)
+        period_start, period_end = s.isoformat(), e.isoformat()
+        date_context = f"Date range: {period_start} to {period_end}"
+        question = question.replace("this month", f"from '{period_start}' to '{period_end}'")
+
+    # THIS YEAR (set to full year)
+    elif "this year" in q_lower:
+        s = datetime.date(today.year, 1, 1)
+        e = datetime.date(today.year, 12, 31)
+        period_start, period_end = s.isoformat(), e.isoformat()
+        date_context = f"Date range: {period_start} to {period_end}"
+        question = question.replace("this year", f"after '{s.isoformat()}'")
+
+    # DAY BEFORE YESTERDAY / YESTERDAY / TODAY (single-day windows)
     elif "day before yesterday" in q_lower:
-        day_before_yesterday = today - datetime.timedelta(days=2)
-        date_context = f"Date: {day_before_yesterday}"
-        question = question.replace("day before yesterday", f"on '{day_before_yesterday}'")
-    
+        d = today - datetime.timedelta(days=2)
+        period_start = period_end = d.isoformat()
+        date_context = f"Date: {period_start}"
+        question = question.replace("day before yesterday", f"on '{period_start}'")
     elif "yesterday" in q_lower:
-        yesterday = today - datetime.timedelta(days=1)
-        date_context = f"Date: {yesterday}"
-        question = question.replace("yesterday", f"on '{yesterday}'")
-    
+        d = today - datetime.timedelta(days=1)
+        period_start = period_end = d.isoformat()
+        date_context = f"Date: {period_start}"
+        question = question.replace("yesterday", f"on '{period_start}'")
     elif "today" in q_lower:
-        date_context = f"Date: {today}"
-        question = question.replace("today", f"on '{today}'")
-    
+        d = today
+        period_start = period_end = d.isoformat()
+        date_context = f"Date: {period_start}"
+        question = question.replace("today", f"on '{period_start}'")
+
+    # LAST WEEK (Monday..Sunday of last week)
     elif "last week" in q_lower:
-        last_week_start = today - datetime.timedelta(days=today.weekday() + 7)
-        last_week_end = last_week_start + datetime.timedelta(days=6)
-        date_context = f"Date range: {last_week_start} to {last_week_end}"
-        question = question.replace("last week", f"between '{last_week_start}' and '{last_week_end}'")
-    
-    return question, date_context
+        # last week Monday..Sunday
+        last_week_end = today - datetime.timedelta(days=today.weekday() + 1)
+        last_week_start = last_week_end - datetime.timedelta(days=6)
+        period_start, period_end = last_week_start.isoformat(), last_week_end.isoformat()
+        date_context = f"Date range: {period_start} to {period_end}"
+        question = question.replace("last week", f"between '{period_start}' and '{period_end}'")
+
+    return question, date_context, period_start, period_end
 
 # --------------------- INTENT DETECTION (Enhanced) ---------------------
 
@@ -208,7 +239,7 @@ class IntentDetector:
         
         return best_intent, best_score
 
-# --------------------- CONTEXT ANALYSIS (Enhanced) ---------------------
+# --------------------- CONTEXT ANALYSIS  ---------------------
 
 def analyze_query_context(question: str) -> dict:
     q_lower = question.lower()
@@ -217,11 +248,15 @@ def analyze_query_context(question: str) -> dict:
         'email': None,
         'is_general_query': False,
         'query_scope': 'unknown',
-        'leave_type': None,
+        'leave_type': None,                # 'SICK LEAVE', 'CASUAL LEAVE', 'COMP OFF' or None
         'requires_aggregation': False,
-        'aggregation_type': None,  # NEW: 'count', 'sum_days', 'duration'
+        'aggregation_type': None,
         'min_days_threshold': None,
-        'is_top_employees_query': False
+        'is_top_employees_query': False,
+        'top_limit': None,
+        # NEW FLAGS:
+        'negative_balance_requested': False,  # user asked "negative leave balance" or similar
+        'status_filter': None,                # 1 = approved, 2 = rejected, 0 = pending, None = no user preference
     }
 
     specific_leave_keywords = ['casual leave', 'sick leave', 'comp off', 
@@ -241,6 +276,7 @@ def analyze_query_context(question: str) -> dict:
         context['email'] = email_match.group()
         context['query_scope'] = 'specific_employee'
     
+    # leave type detection (keep your original logic)
     if 'sick' in q_lower:
         context['leave_type'] = 'SICK LEAVE'
     elif 'casual' in q_lower:
@@ -248,6 +284,37 @@ def analyze_query_context(question: str) -> dict:
     elif 'comp' in q_lower:
         context['leave_type'] = 'COMP OFF'
     
+    # NEW: negative-balance detection (general or specific)
+    if any(kw in q_lower for kw in ['negative leave', 'negative balance', 'negative sick', 'negative casual', 'negative comp', 'negative co', 'negative sl', 'negative cl']):
+        context['negative_balance_requested'] = True
+    # Also support phrasing like "who has negative sick leave" or "list employees with negative cl"
+    if 'negative sick' in q_lower or 'negative sl' in q_lower or 'negative sick leave' in q_lower:
+        context['negative_balance_requested'] = True
+        context['leave_type'] = 'SICK LEAVE'
+    if 'negative casual' in q_lower or 'negative cl' in q_lower or 'negative casual leave' in q_lower:
+        context['negative_balance_requested'] = True
+        context['leave_type'] = 'CASUAL LEAVE'
+    if 'negative comp' in q_lower or 'negative co' in q_lower or 'negative comp off' in q_lower or 'negative compoff' in q_lower:
+        context['negative_balance_requested'] = True
+        context['leave_type'] = 'COMP OFF'
+    
+    # status detection (approved / rejected / pending)
+    # user might say "approved", "approved by hr", "rejected", "pending", "pending requests", etc.
+    if re.search(r'\b(rejected|rejections|rejection|rejected leaves)\b', q_lower):
+        context['status_filter'] = 2
+    elif re.search(r'\b(pending|pending requests|in ?pending|in-?pending|pending leaves)\b', q_lower):
+        context['status_filter'] = 0
+    elif re.search(r'\b(approved|approved by hr|approved leaves|approved leave)\b', q_lower):
+        context['status_filter'] = 1
+    # explicit phrases
+    if 'show the rejected' in q_lower or 'show rejected' in q_lower or 'rejected leaves' in q_lower:
+        context['status_filter'] = 2
+    if 'show pending' in q_lower or 'pending leave' in q_lower or 'pending leaves' in q_lower:
+        context['status_filter'] = 0
+    if 'show approved' in q_lower or 'approved by hr' in q_lower:
+        context['status_filter'] = 1
+
+    # preserve your original general query and scope detection
     if not context['has_specific_email']:
         question_indicators = ['who', 'which', 'what', 'how many', 'list', 'show', 'give', 'top']
         person_plurals = ['employees', 'members', 'people', 'persons', 'staff', 'names']
@@ -263,8 +330,7 @@ def analyze_query_context(question: str) -> dict:
         else:
             context['query_scope'] = 'unclear'
     
-    # NEW: More flexible aggregation detection
-    # Detect if query is about counting/summing leaves
+    # NEW: More flexible aggregation detection (kept your lists)
     aggregation_patterns = {
         'sum_days': [
             'more than', 'greater than', 'over', 'exceeding', 'above',
@@ -298,13 +364,14 @@ def analyze_query_context(question: str) -> dict:
     if days_match:
         context['min_days_threshold'] = int(days_match.group(1))
     
-    # Detect top N queries
+    # Detect top N queries (kept your pattern)
     top_match = re.search(r'top\s+(\d+)\s+(employees|members)', q_lower)
     if top_match:
         context['is_top_employees_query'] = True
         context['top_limit'] = int(top_match.group(1))
     
     return context
+
 
 # --------------------- QUICK SYNTAX FIXES (Enhanced) ---------------------
 
@@ -662,10 +729,21 @@ MYSQL SYNTAX REQUIREMENTS:
 - Date format: 'YYYY-MM-DD'
 - **CRITICAL: cl/sl/co are VARCHAR, use CAST(column AS DECIMAL(10,2)) in ORDER BY for min/max**
 
+IMPORTANT DATE-OVERLAP RULE:
+When filtering by a month / last month / date range, DO NOT only use `from BETWEEN start AND end` or `from >= start`.
+Rows where the leave *overlaps* the requested period must be included. Use the overlap condition:
+`WHERE (`from` <= 'PERIOD_END' AND `to` >= 'PERIOD_START')`
+Examples:
+- Leave 2025-09-29 to 2025-10-10 should be included in "last month (Oct 2025)" queries.
+- Leave 2025-10-30 to 2025-11-02 should be included in "this month (Nov 2025)" queries if overlapping.
+When giving SQL examples, substitute actual dates for PERIOD_START and PERIOD_END.
+
+
 {context_hint}
 {intent_hint}
 {warning}
 
+CRITICAL EXAMPLES:
 CRITICAL EXAMPLES:
 Q: "what is leave balance/ latest leave balance/ latest leavebalance of john@example.com"
 A: SELECT cl, sl, co FROM leavebalance WHERE empemail = 'john@example.com';
@@ -680,7 +758,7 @@ Q: "who has the lowest sick leave balance"
 A: SELECT empname, empemail, sl FROM leavebalance ORDER BY CAST(sl AS DECIMAL(10,2)) ASC LIMIT 1;
 
 Q: "what is the leave duration of putsalaharshapriya@gmail.com in her last leave?" 
-A: SELECT DATEDIFF(`to`, `from`) + 1 FROM leaves WHERE empemail = 'putsalaharshapriya@gmail.com' ORDER BY `from` DESC LIMIT 1;
+A: SELECT DATEDIFF(`to`, `from`) + 1 AS duration FROM leaves WHERE empemail = 'putsalaharshapriya@gmail.com' ORDER BY `from` DESC LIMIT 1;
 
 Q: "top 5 employees with highest comp off balance"
 A: SELECT empname, empemail, co FROM leavebalance ORDER BY CAST(co AS DECIMAL(10,2)) DESC LIMIT 5;
@@ -718,62 +796,168 @@ A: SELECT empname, empemail, COUNT(*) AS leave_count FROM leaves GROUP BY empnam
 Q: "phone number of john@example.com"
 A: SELECT DISTINCT empph FROM leaves WHERE empemail = 'john@example.com' LIMIT 1;
 
-**NEW AGGREGATION EXAMPLES (TOTAL DAYS CALCULATION):**
+**NEW AGGREGATION EXAMPLES (TOTAL DAYS CALCULATION USING OVERLAP CLAUSE):**
+
+-- NOTE: use the overlap clause WHENEVER filtering by a date period:
+-- OVERLAP CLAUSE: (`from` <= '<PERIOD_END>' AND `to` >= '<PERIOD_START>')
 
 Q: "give me the list of employees who took more than 5 days in this month"
-A: SELECT empname, empemail, SUM(DATEDIFF(`to`, `from`) + 1) AS total_days FROM leaves WHERE `from` >= DATE_FORMAT(CURDATE(), '%Y-%m-01') GROUP BY empname, empemail HAVING total_days > 5 ORDER BY total_days DESC;
+A: SELECT empname, empemail, SUM(DATEDIFF(`to`, `from`) + 1) AS total_days
+   FROM leaves
+   WHERE (`from` <= LAST_DAY(CURDATE()) AND `to` >= DATE_FORMAT(CURDATE(), '%Y-%m-01'))
+   GROUP BY empname, empemail
+   HAVING total_days > 5
+   ORDER BY total_days DESC;
 
 Q: "employees who took more leaves in this month"
-A: SELECT empname, empemail, COUNT(*) AS leave_count, SUM(DATEDIFF(`to`, `from`) + 1) AS total_days FROM leaves WHERE `from` >= DATE_FORMAT(CURDATE(), '%Y-%m-01') GROUP BY empname, empemail ORDER BY total_days DESC;
+A: SELECT empname, empemail, COUNT(*) AS leave_count, SUM(DATEDIFF(`to`, `from`) + 1) AS total_days
+   FROM leaves
+   WHERE (`from` <= LAST_DAY(CURDATE()) AND `to` >= DATE_FORMAT(CURDATE(), '%Y-%m-01'))
+   GROUP BY empname, empemail
+   ORDER BY total_days DESC;
 
 Q: "give me the employee names who took leaves more leaves in this month"
-A: SELECT empname, empemail, COUNT(*) AS leave_count, SUM(DATEDIFF(`to`, `from`) + 1) AS total_days FROM leaves WHERE `from` >= DATE_FORMAT(CURDATE(), '%Y-%m-01') GROUP BY empname, empemail ORDER BY total_days DESC;
+A: SELECT empname, empemail, COUNT(*) AS leave_count, SUM(DATEDIFF(`to`, `from`) + 1) AS total_days
+   FROM leaves
+   WHERE (`from` <= LAST_DAY(CURDATE()) AND `to` >= DATE_FORMAT(CURDATE(), '%Y-%m-01'))
+   GROUP BY empname, empemail
+   ORDER BY total_days DESC;
 
 Q: "employee names who took more leaves this month"
-A: SELECT empname, empemail, COUNT(*) AS leave_count, SUM(DATEDIFF(`to`, `from`) + 1) AS total_days FROM leaves WHERE `from` >= DATE_FORMAT(CURDATE(), '%Y-%m-01') GROUP BY empname, empemail ORDER BY total_days DESC;
+A: SELECT empname, empemail, COUNT(*) AS leave_count, SUM(DATEDIFF(`to`, `from`) + 1) AS total_days
+   FROM leaves
+   WHERE (`from` <= LAST_DAY(CURDATE()) AND `to` >= DATE_FORMAT(CURDATE(), '%Y-%m-01'))
+   GROUP BY empname, empemail
+   ORDER BY total_days DESC;
 
 Q: "list employees took most leaves this month"
-A: SELECT empname, empemail, COUNT(*) AS leave_count, SUM(DATEDIFF(`to`, `from`) + 1) AS total_days FROM leaves WHERE `from` >= DATE_FORMAT(CURDATE(), '%Y-%m-01') GROUP BY empname, empemail ORDER BY total_days DESC;
+A: SELECT empname, empemail, COUNT(*) AS leave_count, SUM(DATEDIFF(`to`, `from`) + 1) AS total_days
+   FROM leaves
+   WHERE (`from` <= LAST_DAY(CURDATE()) AND `to` >= DATE_FORMAT(CURDATE(), '%Y-%m-01'))
+   GROUP BY empname, empemail
+   ORDER BY total_days DESC;
 
 Q: "show me employees with maximum leaves this month"
-A: SELECT empname, empemail, COUNT(*) AS leave_count, SUM(DATEDIFF(`to`, `from`) + 1) AS total_days FROM leaves WHERE `from` >= DATE_FORMAT(CURDATE(), '%Y-%m-01') GROUP BY empname, empemail ORDER BY total_days DESC;
+A: SELECT empname, empemail, COUNT(*) AS leave_count, SUM(DATEDIFF(`to`, `from`) + 1) AS total_days
+   FROM leaves
+   WHERE (`from` <= LAST_DAY(CURDATE()) AND `to` >= DATE_FORMAT(CURDATE(), '%Y-%m-01'))
+   GROUP BY empname, empemail
+   ORDER BY total_days DESC;
 
 Q: "who took highest number of leaves this month"
-A: SELECT empname, empemail, COUNT(*) AS leave_count, SUM(DATEDIFF(`to`, `from`) + 1) AS total_days FROM leaves WHERE `from` >= DATE_FORMAT(CURDATE(), '%Y-%m-01') GROUP BY empname, empemail ORDER BY total_days DESC LIMIT 1;
+A: SELECT empname, empemail, COUNT(*) AS leave_count, SUM(DATEDIFF(`to`, `from`) + 1) AS total_days
+   FROM leaves
+   WHERE (`from` <= LAST_DAY(CURDATE()) AND `to` >= DATE_FORMAT(CURDATE(), '%Y-%m-01'))
+   GROUP BY empname, empemail
+   ORDER BY total_days DESC
+   LIMIT 1;
 
 Q: "how many members took leave more than 3 days in this month"
-A: SELECT COUNT(*) FROM (SELECT empemail FROM leaves WHERE `from` >= DATE_FORMAT(CURDATE(), '%Y-%m-01') GROUP BY empemail HAVING SUM(DATEDIFF(`to`, `from`) + 1) > 3) AS subquery;
+A: SELECT COUNT(*) FROM (
+     SELECT empemail
+     FROM leaves
+     WHERE (`from` <= LAST_DAY(CURDATE()) AND `to` >= DATE_FORMAT(CURDATE(), '%Y-%m-01'))
+     GROUP BY empemail
+     HAVING SUM(DATEDIFF(`to`, `from`) + 1) > 3
+   ) AS subquery;
 
 Q: "top 5 employees who took most leaves this month"
-A: SELECT empname, empemail, COUNT(*) AS leave_count, SUM(DATEDIFF(`to`, `from`) + 1) AS total_days FROM leaves WHERE `from` >= DATE_FORMAT(CURDATE(), '%Y-%m-01') GROUP BY empname, empemail ORDER BY total_days DESC LIMIT 5;
+A: SELECT empname, empemail, COUNT(*) AS leave_count, SUM(DATEDIFF(`to`, `from`) + 1) AS total_days
+   FROM leaves
+   WHERE (`from` <= LAST_DAY(CURDATE()) AND `to` >= DATE_FORMAT(CURDATE(), '%Y-%m-01'))
+   GROUP BY empname, empemail
+   ORDER BY total_days DESC
+   LIMIT 5;
 
 Q: "give me employee records who took leave more than 3 days in this month"
-A: SELECT empname, empemail, SUM(DATEDIFF(`to`, `from`) + 1) AS total_days FROM leaves WHERE `from` >= DATE_FORMAT(CURDATE(), '%Y-%m-01') GROUP BY empname, empemail HAVING total_days > 3 ORDER BY total_days DESC;
+A: SELECT empname, empemail, SUM(DATEDIFF(`to`, `from`) + 1) AS total_days
+   FROM leaves
+   WHERE (`from` <= LAST_DAY(CURDATE()) AND `to` >= DATE_FORMAT(CURDATE(), '%Y-%m-01'))
+   GROUP BY empname, empemail
+   HAVING total_days > 3
+   ORDER BY total_days DESC;
 
 Q: "list of employees who took more number of leaves in this month"
-A: SELECT empname, empemail, COUNT(*) AS leave_count, SUM(DATEDIFF(`to`, `from`) + 1) AS total_days FROM leaves WHERE `from` >= DATE_FORMAT(CURDATE(), '%Y-%m-01') GROUP BY empname, empemail ORDER BY total_days DESC;
+A: SELECT empname, empemail, COUNT(*) AS leave_count, SUM(DATEDIFF(`to`, `from`) + 1) AS total_days
+   FROM leaves
+   WHERE (`from` <= LAST_DAY(CURDATE()) AND `to` >= DATE_FORMAT(CURDATE(), '%Y-%m-01'))
+   GROUP BY empname, empemail
+   ORDER BY total_days DESC;
 
 Q: "give me employee names who took leaves more than 3 days in this month"
-A: SELECT empname, empemail, SUM(DATEDIFF(`to`, `from`) + 1) AS total_days FROM leaves WHERE `from` >= DATE_FORMAT(CURDATE(), '%Y-%m-01') GROUP BY empname, empemail HAVING total_days > 3 ORDER BY total_days DESC;
+A: SELECT empname, empemail, SUM(DATEDIFF(`to`, `from`) + 1) AS total_days
+   FROM leaves
+   WHERE (`from` <= LAST_DAY(CURDATE()) AND `to` >= DATE_FORMAT(CURDATE(), '%Y-%m-01'))
+   GROUP BY empname, empemail
+   HAVING total_days > 3
+   ORDER BY total_days DESC;
 
 Q: "employees who took more than 5 days last month"
-A: SELECT empname, empemail, SUM(DATEDIFF(`to`, `from`) + 1) AS total_days FROM leaves WHERE `from` >= DATE_FORMAT(DATE_SUB(CURDATE(), INTERVAL 1 MONTH), '%Y-%m-01') AND `from` < DATE_FORMAT(CURDATE(), '%Y-%m-01') GROUP BY empname, empemail HAVING total_days > 5 ORDER BY total_days DESC;
+A: SELECT empname, empemail, SUM(DATEDIFF(`to`, `from`) + 1) AS total_days
+   FROM leaves
+   WHERE (`from` <= LAST_DAY(DATE_SUB(CURDATE(), INTERVAL 1 MONTH)) AND `to` >= DATE_FORMAT(DATE_SUB(CURDATE(), INTERVAL 1 MONTH), '%Y-%m-01'))
+   GROUP BY empname, empemail
+   HAVING total_days > 5
+   ORDER BY total_days DESC;
 
 Q: "top 3 employees with most leaves this year"
-A: SELECT empname, empemail, COUNT(*) AS leave_count, SUM(DATEDIFF(`to`, `from`) + 1) AS total_days FROM leaves WHERE YEAR(`from`) = YEAR(CURDATE()) GROUP BY empname, empemail ORDER BY total_days DESC LIMIT 3;
+A: SELECT empname, empemail, COUNT(*) AS leave_count, SUM(DATEDIFF(`to`, `from`) + 1) AS total_days
+   FROM leaves
+   WHERE (`from` <= LAST_DAY(CONCAT(YEAR(CURDATE()), '-12-31')) AND `to` >= DATE_FORMAT(CONCAT(YEAR(CURDATE()), '-01-01'), '%Y-%m-%d'))
+   GROUP BY empname, empemail
+   ORDER BY total_days DESC
+   LIMIT 3;
 
 Q: "employees who took more leaves last 30 days"
-A: SELECT empname, empemail, COUNT(*) AS leave_count, SUM(DATEDIFF(`to`, `from`) + 1) AS total_days FROM leaves WHERE `from` >= DATE_SUB(CURDATE(), INTERVAL 30 DAY) GROUP BY empname, empemail ORDER BY total_days DESC;
+A: SELECT empname, empemail, COUNT(*) AS leave_count, SUM(DATEDIFF(`to`, `from`) + 1) AS total_days
+   FROM leaves
+   WHERE (`from` <= CURDATE() AND `to` >= DATE_SUB(CURDATE(), INTERVAL 30 DAY))
+   GROUP BY empname, empemail
+   ORDER BY total_days DESC;
+   
+Q:  give me the list of employees who has negative leave balance
+A:  SELECT empname, empemail, cl, sl, co
+FROM leavebalance
+WHERE (CAST(cl AS DECIMAL(10,2)) + CAST(sl AS DECIMAL(10,2)) + CAST(co AS DECIMAL(10,2))) < 0;
 
-CRITICAL DATE RANGE RULES:
+Q: who has negative sick leave
+A: SELECT empname, empemail, sl
+FROM leavebalance
+WHERE CAST(sl AS DECIMAL(10,2)) < 0;
+
+
+CRITICAL DATE RANGE RULES (UPDATED - USE OVERLAP ALWAYS):
 1. When asked for "leave records between DATE1 and DATE2" OR "last month records" OR "records from DATE1 to DATE2":
-   → Filter by leave start date: WHERE `from` BETWEEN 'DATE1' AND 'DATE2'
-   
+   → Include any leave that **overlaps** the requested period. Use:
+     `WHERE (\`from\` <= '<PERIOD_END>' AND \`to\` >= '<PERIOD_START>')`
+   Examples:
+     - For explicit dates: replace <PERIOD_START> and <PERIOD_END> with 'YYYY-MM-DD'.
+     - For "this month": PERIOD_START = DATE_FORMAT(CURDATE(), '%Y-%m-01'), PERIOD_END = LAST_DAY(CURDATE()).
+     - For "last month": PERIOD_START = DATE_FORMAT(DATE_SUB(CURDATE(), INTERVAL 1 MONTH), '%Y-%m-01'), PERIOD_END = LAST_DAY(DATE_SUB(CURDATE(), INTERVAL 1 MONTH)).
+
 2. When asked "who is on leave on DATE" OR "members on leave on DATE" OR "who applied leave on DATE":
-   → Find leaves that include that date: WHERE 'DATE' BETWEEN `from` AND `to`
-   
+   → Find leaves that include that date: `WHERE 'DATE' BETWEEN \`from\` AND \`to\`` (this is equivalent to overlap with PERIOD_START=DATE and PERIOD_END=DATE).
+
 3. When asked "who is on leave today":
-   → Use: WHERE CURDATE() BETWEEN `from` AND `to`
+   → Use: `WHERE CURDATE() BETWEEN \`from\` AND \`to\``
+
+4. Aggregations (SUM/HAVING/COUNT/TOP N):
+   → Always apply the same overlap WHERE clause before grouping. For example:
+     SELECT empname, empemail, SUM(DATEDIFF(`to`, `from`) + 1) AS total_days
+     FROM leaves
+     WHERE (`from` <= '<PERIOD_END>' AND `to` >= '<PERIOD_START>')
+     GROUP BY empname, empemail
+     HAVING total_days > X
+     ORDER BY total_days DESC;
+
+5. Single-leave duration queries (longest single leave):
+   → Use the overlap clause for the period if the question restricts to a period, e.g.:
+     SELECT empname, empemail, DATEDIFF(`to`, `from`) + 1 AS duration
+     FROM leaves
+     WHERE (`from` <= '<PERIOD_END>' AND `to` >= '<PERIOD_START>')
+     ORDER BY duration DESC LIMIT 1;
+
+6. When constructing examples for the LLM prompts, always show the overlap clause rather than `from BETWEEN` or `from >=` so the model learns the correct pattern.
 
 Now generate MySQL query for:"""
 
@@ -819,6 +1003,215 @@ def generate_sql(tokenizer, model, messages: list, max_new_tokens: int = 400) ->
     fixed_sql = quick_syntax_fix(fixed_sql)
     
     return fixed_sql
+
+# --------------------- SQL ADJUSTER: negative-balance + status enforcement ---------------------
+
+def adjust_sql_for_negative_and_status(sql: str, context: dict) -> str:
+    """
+    Modify sql string based on context:
+    - If context['negative_balance_requested'] and SQL queries leavebalance:
+        * If context['leave_type'] specified -> check that column < 0
+        * Else -> check total_balance < 0 where total_balance = CAST(cl)+CAST(sl)+CAST(co)
+    - If SQL queries leaves table:
+        * Enforce status filter:
+            - if user specified status_filter -> use that
+            - else default to status = 1 (approved)
+    Returns modified SQL (idempotent).
+    """
+    modified_sql = sql
+
+    # 1) Negative leavebalance handling
+    if context.get('negative_balance_requested', False):
+        if re.search(r'\bFROM\s+`?leavebalance`?\b', modified_sql, flags=re.IGNORECASE):
+            # choose which column to check
+            lt = context.get('leave_type')
+            if lt:
+                # map leave type to column
+                col_map = {
+                    'SICK LEAVE': 'sl',
+                    'CASUAL LEAVE': 'cl',
+                    'COMP OFF': 'co'
+                }
+                col = col_map.get(lt)
+                if col:
+                    negative_clause = f"CAST({col} AS DECIMAL(10,2)) < 0"
+                else:
+                    # fallback to total
+                    negative_clause = ("(CAST(cl AS DECIMAL(10,2)) + CAST(sl AS DECIMAL(10,2)) + "
+                                       "CAST(co AS DECIMAL(10,2))) < 0")
+            else:
+                # total negative
+                negative_clause = ("(CAST(cl AS DECIMAL(10,2)) + CAST(sl AS DECIMAL(10,2)) + "
+                                   "CAST(co AS DECIMAL(10,2))) < 0")
+
+            # Insert negative_clause into WHERE/HAVING appropriately. Use similar approach to injectors.
+            # If a WHERE exists, append AND (<negative_clause>), else insert WHERE <negative_clause>.
+            m = re.search(r'\b(GROUP\s+BY|ORDER\s+BY|HAVING|LIMIT)\b', modified_sql, flags=re.IGNORECASE)
+            insert_pos = m.start() if m else None
+            has_where = bool(re.search(r'\bWHERE\b', modified_sql, flags=re.IGNORECASE))
+
+            # If the SQL already contains the negative clause, skip
+            if re.search(re.escape(negative_clause), modified_sql, flags=re.IGNORECASE):
+                pass
+            else:
+                if has_where:
+                    if insert_pos:
+                        before = modified_sql[:insert_pos].rstrip()
+                        after = modified_sql[insert_pos:]
+                        modified_sql = before + f" AND ({negative_clause}) " + after
+                    else:
+                        if modified_sql.rstrip().endswith(';'):
+                            modified_sql = modified_sql.rstrip()[:-1].rstrip() + f" AND ({negative_clause});"
+                        else:
+                            modified_sql = modified_sql.rstrip() + f" AND ({negative_clause})"
+                else:
+                    where_clause = f" WHERE ({negative_clause}) "
+                    if insert_pos:
+                        before = modified_sql[:insert_pos]
+                        after = modified_sql[insert_pos:]
+                        modified_sql = before + where_clause + after
+                    else:
+                        if modified_sql.rstrip().endswith(';'):
+                            modified_sql = modified_sql.rstrip()[:-1].rstrip() + where_clause + ';'
+                        else:
+                            modified_sql = modified_sql.rstrip() + where_clause
+
+            # tidy
+            modified_sql = re.sub(r'\s+', ' ', modified_sql).strip()
+
+    # 2) Leaves table status enforcement
+    # If query references 'FROM leaves', ensure status filter is present (either user requested or default to 1)
+    if re.search(r'\bFROM\s+`?leaves`?\b', modified_sql, flags=re.IGNORECASE):
+        # decide desired status
+        desired_status = context.get('status_filter', None)
+        if desired_status is None:
+            # Only default to approved(1) when the query is not explicitly about pending/rejected
+            # Default behaviour in your requirement: always show approved leaves unless user asked pending/rejected
+            desired_status = 1
+
+        modified_sql = inject_status_filter(modified_sql, desired_status)
+
+    return modified_sql
+
+
+# --------------------- SQL STATUS FILTER INJECTOR ---------------------
+
+def inject_status_filter(sql: str, desired_status: int) -> str:
+    """
+    Inject `status = <desired_status>` into SQL that queries the 'leaves' table.
+    - If SQL references the leaves table (FROM leaves), it will ensure the WHERE clause includes status check.
+    - If a status condition already exists, it will not duplicate it.
+    """
+    if desired_status is None:
+        return sql
+
+    # quick check: only apply for queries that reference 'FROM leaves' (case-insensitive)
+    if not re.search(r'\bFROM\s+`?leaves`?\b', sql, flags=re.IGNORECASE):
+        return sql
+
+    # if a status condition already exists (status = X or status IN (...)), skip
+    if re.search(r'\bstatus\s*=\s*\d+\b', sql, flags=re.IGNORECASE) or re.search(r'\bstatus\s+IN\s*\(', sql, flags=re.IGNORECASE):
+        return sql
+
+    status_clause = f"status = {int(desired_status)}"
+    # find insertion point for WHERE as in inject_overlap_filter
+    m = re.search(r'\b(GROUP\s+BY|ORDER\s+BY|HAVING|LIMIT)\b', sql, flags=re.IGNORECASE)
+    insert_pos = m.start() if m else None
+    has_where = bool(re.search(r'\bWHERE\b', sql, flags=re.IGNORECASE))
+
+    if has_where:
+        if insert_pos:
+            before = sql[:insert_pos].rstrip()
+            after = sql[insert_pos:]
+            new_sql = before + f" AND ({status_clause}) " + after
+        else:
+            if sql.rstrip().endswith(';'):
+                new_sql = sql.rstrip()[:-1].rstrip() + f" AND ({status_clause});"
+            else:
+                new_sql = sql.rstrip() + f" AND ({status_clause})"
+    else:
+        where_clause = f" WHERE ({status_clause}) "
+        if insert_pos:
+            before = sql[:insert_pos]
+            after = sql[insert_pos:]
+            new_sql = before + where_clause + after
+        else:
+            if sql.rstrip().endswith(';'):
+                new_sql = sql.rstrip()[:-1].rstrip() + where_clause + ';'
+            else:
+                new_sql = sql.rstrip() + where_clause
+
+    new_sql = re.sub(r'\s+', ' ', new_sql).strip()
+    return new_sql
+
+
+# --------------------- SQL DATE OVERLAP INJECTOR ---------------------
+
+# Robust helper: case-insensitive presence check for a clause in SQL
+def _clause_already_present(sql: str, clause: str) -> bool:
+    """
+    Returns True if clause (or a case-insensitive equivalent) already appears in sql.
+    Normalizes whitespace and lowercases both strings before checking.
+    """
+    if not sql or not clause:
+        return False
+    norm_sql = re.sub(r'\s+', ' ', sql).strip().lower()
+    norm_clause = re.sub(r'\s+', ' ', clause).strip().lower()
+    return norm_clause in norm_sql
+
+# Updated injector that uses the helper
+def inject_overlap_filter(sql: str, period_start: str, period_end: str) -> str:
+    """
+    Ensure SQL filters rows that overlap the date window [period_start, period_end].
+    If SQL already has the overlap clause, do nothing.
+    Inserts the overlap clause before GROUP BY/ORDER BY/HAVING/LIMIT or at end.
+    """
+    if not (period_start and period_end):
+        return sql
+
+    # canonical clause to inject (use consistent formatting)
+    overlap_clause = f"(`from` <= '{period_end}' AND `to` >= '{period_start}')"
+
+    # If a semantically equivalent clause already present (case-insensitive), skip injection
+    if _clause_already_present(sql, overlap_clause):
+        return sql
+
+    # find insertion point: first occurrence of GROUP BY / ORDER BY / HAVING / LIMIT
+    m = re.search(r'\b(GROUP\s+BY|ORDER\s+BY|HAVING|LIMIT)\b', sql, flags=re.IGNORECASE)
+    insert_pos = m.start() if m else None
+
+    # does SQL already have WHERE?
+    has_where = bool(re.search(r'\bWHERE\b', sql, flags=re.IGNORECASE))
+
+    if has_where:
+        # Insert " AND (<overlap_clause>)" just before the first group/order/having/limit (or append)
+        if insert_pos:
+            before = sql[:insert_pos].rstrip()
+            after = sql[insert_pos:]
+            before = before + f" AND {overlap_clause} "
+            new_sql = before + after
+        else:
+            # append before final semicolon (if present) or to end
+            if sql.rstrip().endswith(';'):
+                new_sql = sql.rstrip()[:-1].rstrip() + f" AND {overlap_clause};"
+            else:
+                new_sql = sql.rstrip() + f" AND {overlap_clause}"
+    else:
+        # no WHERE: insert " WHERE (<overlap_clause>) " before first group/order/having/limit or before semicolon
+        where_clause = f" WHERE {overlap_clause} "
+        if insert_pos:
+            before = sql[:insert_pos]
+            after = sql[insert_pos:]
+            new_sql = before + where_clause + after
+        else:
+            if sql.rstrip().endswith(';'):
+                new_sql = sql.rstrip()[:-1].rstrip() + where_clause + ';'
+            else:
+                new_sql = sql.rstrip() + where_clause
+
+    # tidy spaces and return
+    new_sql = re.sub(r'\s+', ' ', new_sql).strip()
+    return new_sql
 
 # --------------------- LLM REPAIR (Same as original) ---------------------
 
@@ -1206,7 +1599,7 @@ def chat():
         
         # Preprocess question for dates
         original_q = question
-        question, date_context = preprocess_question(question)
+        question, date_context, period_start, period_end = preprocess_question(question)
         
         # Detect intent
         intent, confidence = intent_detector.detect(question)
@@ -1220,11 +1613,22 @@ def chat():
         # Build prompt and generate SQL
         messages = build_llama_prompt(question, intent, context)
         raw_sql = generate_sql(tokenizer, model, messages)
-        
+
+        # If preprocess returned a period, inject overlap filter to capture leaves overlapping the period
+        # preprocess_question now returns (question, date_context, period_start, period_end)
+        # (Make sure you earlier captured period_start/period_end when calling preprocess_question)
+        if period_start and period_end:
+            raw_sql = inject_overlap_filter(raw_sql, period_start, period_end)
+
+        # NEW: adjust for negative balance intent and status enforcement
+        raw_sql = adjust_sql_for_negative_and_status(raw_sql, context)
+
+
         # Validate and repair SQL
         final_sql, is_valid, attempts = validate_and_repair_sql(
             conn, raw_sql, tokenizer, model, schema, question, intent, max_attempts=3
         )
+
         print(f"final {final_sql}\n")
         # Execute query
         cols, rows = run_query(conn, final_sql)
