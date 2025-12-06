@@ -214,7 +214,10 @@ class IntentDetector:
     
     def detect(self, question: str):
         q_emb = self.model.encode(question)
+        q_lower = question.lower()
         
+        if any(word in q_lower for word in ['applied', 'application', 'submitted', 'apply for leave on', 'apply on']):
+            return "leaves", 0.95 
         scores = {
             intent: float(util.cos_sim(q_emb, emb).max())
             for intent, emb in self.intent_embeds.items()
@@ -234,6 +237,8 @@ class IntentDetector:
 
 # --------------------- CONTEXT ANALYSIS WITH STATUS DETECTION ---------------------
 
+# Replace analyze_query_context function with this improved version:
+
 def analyze_query_context(question: str) -> dict:
     q_lower = question.lower()
     context = {
@@ -247,44 +252,61 @@ def analyze_query_context(question: str) -> dict:
         'min_days_threshold': None,
         'is_top_employees_query': False,
         'has_date_range': False,
-        'status_filter': None,  
-        'is_application_query': False  
+        'status_filter': None,
+        'is_application_query': False,
+        'is_leave_for_date_query': False
     }
-
-    # Detect status-related queries
+    if re.search(r'\b(when|what date|which date|on what day)\b.*\bappl(?:y|ied|ying)', q_lower):
+        context['is_application_query'] = True
+        context['status_filter'] = None
+        context['check_applied_date'] = True
+        return context
+    
+    if re.search(r'\bappl(?:y|ied|ying)\s+leave\s+for\s+(today|tomorrow|yesterday|\d{4}-\d{2}-\d{2}|on\s+\'\d{4}-\d{2}-\d{2}\')', q_lower):
+        context['is_leave_for_date_query'] = True
+        context['status_filter'] = None
+        return context
+    # ===== PRIORITY 1: Detect "applied" queries (MUST come first) =====
     if any(keyword in q_lower for keyword in ['applied', 'application', 'submitted', 'apply', 'applying']):
-        # Check if it's asking about applications in a time period
-        if 'in period' in q_lower or 'last month' in q_lower or 'this month' in q_lower or 'last week' in q_lower:
-            context['is_application_query'] = True
-            context['status_filter'] = None  # NO status filter for applications
-            context['check_applied_date'] = True  # NEW FLAG
+        if 'for' in q_lower:
+            # Check if "for" is followed by time period (not specific date)
+            if any(period in q_lower for period in ['last month', 'this month', 'last week', 'in period', 'in last', 'in this']):
+                context['is_application_query'] = True
+                context['status_filter'] = None
+                context['check_applied_date'] = True
+            # If "for" is followed by specific date, it's a leave start date query
+            elif re.search(r'for\s+(today|tomorrow|yesterday|\d{4}-\d{2}-\d{2})', q_lower):
+                context['is_leave_for_date_query'] = True
+                context['status_filter'] = None
+            else:
+                # Default to application query
+                context['is_application_query'] = True
+                context['status_filter'] = None
+                context['check_applied_date'] = True
         else:
+            # No "for" keyword, definitely submission date
             context['is_application_query'] = True
             context['status_filter'] = None
-            context['check_applied_date'] = True  # NEW FLAG
-    # Detect status-related queries for APPROVED leaves
+            context['check_applied_date'] = True
+    
+    # ===== PRIORITY 2: Detect status-related queries =====
     elif any(word in q_lower for word in ['rejected', 'reject', 'denied']):
         context['status_filter'] = 2
-        context['check_applied_date'] = False
     elif any(word in q_lower for word in ['pending', 'awaiting', 'waiting for approval']):
         context['status_filter'] = 0
-        context['check_applied_date'] = False
     elif any(word in q_lower for word in ['approved', 'granted', 'accepted']):
         context['status_filter'] = 1
-        context['check_applied_date'] = False
     elif any(word in q_lower for word in ['took', 'taken', 'on leave', 'kept leave', 'show leaves', 'latest leave', 'longest leave', 'most leaves']):
         context['status_filter'] = 1
-        context['check_applied_date'] = False
     else:
         context['status_filter'] = 1
-        context['check_applied_date'] = False
 
-    # Detect if query has a date range/period
+    # ===== DATE RANGE DETECTION =====
     if 'in period' in q_lower or 'between' in q_lower:
         context['has_date_range'] = True
 
-    specific_leave_keywords = ['casual leave', 'sick leave', 'comp off',
-                               'cl ', 'sl ', 'co ', 'casual', 'sick', 'comp']
+    # ===== LEAVE TYPE DETECTION =====
+    specific_leave_keywords = ['casual leave', 'sick leave', 'comp off', 'cl ', 'sl ', 'co ', 'casual', 'sick', 'comp']
     total_keywords = ['total', 'overall', 'combined', 'leave balance', 'all leaves']
     
     has_specific_type = any(keyword in q_lower for keyword in specific_leave_keywords)
@@ -292,26 +314,72 @@ def analyze_query_context(question: str) -> dict:
     
     if not has_specific_type or has_total_keyword:
         context['is_total_balance_query'] = True
-    generic_employee_patterns = [
-        r'\ba[n]?\s+employee\b',
-        r'\bany\s+employee\b',
-        r'\bsome\s+employee\b',
-        r'\ban\s+employee\b'
-    ]
     
-    is_generic_employee = any(re.search(pattern, q_lower) for pattern in generic_employee_patterns)
+    # ===== IMPROVED: EMAIL vs NAME DETECTION =====
+    # First, try to find email
     email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
     email_match = re.search(email_pattern, question)
+    
     if email_match:
+        # Clear email found
         context['has_specific_email'] = True
         context['email'] = email_match.group()
         context['query_scope'] = 'specific_employee'
-    elif is_generic_employee:
-        context['has_specific_email'] = False
-        context['email'] = None
-        context['query_scope'] = 'any_employee'
-        context['is_general_query'] = True
+    else:
+        # No email found - check if it's a name or generic query
+        # Extract potential names (words that are capitalized or between quotes)
+        name_patterns = [
+            r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\b',  # Capitalized names
+            r'"([^"]+)"',  # Quoted text
+            r"'([^']+)'"   # Single quoted text
+        ]
+        
+        found_name = None
+        for pattern in name_patterns:
+            name_match = re.search(pattern, question)
+            if name_match:
+                potential_name = name_match.group(1)
+                # Exclude common question words
+                if potential_name.lower() not in ['who', 'what', 'when', 'where', 'which', 'how', 'can', 'show', 'give']:
+                    found_name = potential_name
+                    break
+        
+        # Check for generic employee phrases
+        generic_employee_patterns = [
+            r'\ba[n]?\s+employee\b',
+            r'\bany\s+employee\b',
+            r'\bsome\s+employee\b'
+        ]
+        
+        is_generic = any(re.search(pat, q_lower) for pat in generic_employee_patterns)
+        
+        if is_generic:
+            context['has_specific_email'] = False
+            context['email'] = None
+            context['query_scope'] = 'any_employee'
+            context['is_general_query'] = True
+        elif found_name:
+            # Name found but no email - treat as name search
+            context['has_specific_email'] = False
+            context['employee_name'] = found_name
+            context['query_scope'] = 'specific_employee_by_name'
+        else:
+            # No email, no name - check if it's a general query
+            question_indicators = ['who', 'which', 'what', 'how many', 'list', 'show', 'give', 'top']
+            person_plurals = ['employees', 'members', 'people', 'persons', 'staff', 'names']
+            quantifiers = ['all', 'any', 'every', 'everyone', 'anyone', 'maximum', 'most']
+            
+            has_question_word = any(word in q_lower for word in question_indicators)
+            has_plural = any(word in q_lower for word in person_plurals)
+            has_quantifier = any(word in q_lower for word in quantifiers)
+            
+            if has_question_word or has_plural or has_quantifier:
+                context['is_general_query'] = True
+                context['query_scope'] = 'all_employees'
+            else:
+                context['query_scope'] = 'unclear'
     
+    # ===== LEAVE TYPE =====
     if 'sick' in q_lower:
         context['leave_type'] = 'SICK LEAVE'
     elif 'casual' in q_lower:
@@ -319,21 +387,7 @@ def analyze_query_context(question: str) -> dict:
     elif 'comp' in q_lower:
         context['leave_type'] = 'COMP OFF'
     
-    if not context['has_specific_email']:
-        question_indicators = ['who', 'which', 'what', 'how many', 'list', 'show', 'give', 'top']
-        person_plurals = ['employees', 'members', 'people', 'persons', 'staff', 'names']
-        quantifiers = ['all', 'any', 'every', 'everyone', 'anyone', 'maximum', 'most']
-        
-        has_question_word = any(word in q_lower for word in question_indicators)
-        has_plural = any(word in q_lower for word in person_plurals)
-        has_quantifier = any(word in q_lower for word in quantifiers)
-        
-        if has_question_word or has_plural or has_quantifier:
-            context['is_general_query'] = True
-            context['query_scope'] = 'all_employees'
-        else:
-            context['query_scope'] = 'unclear'
-    
+    # ===== AGGREGATION DETECTION =====
     aggregation_patterns = {
         'sum_days': [
             'more than', 'greater than', 'over', 'exceeding', 'above',
@@ -375,6 +429,7 @@ def analyze_query_context(question: str) -> dict:
 # --------------------- QUICK SYNTAX FIXES ---------------------
 
 def quick_syntax_fix(sql: str) -> str:
+    sql = re.sub(r'DATEDIFF`', r'DATEDIFF(`', sql, flags=re.IGNORECASE)
     sql = re.sub(r'\s+NULLS\s+(FIRST|LAST)', '', sql, flags=re.IGNORECASE)
     sql = re.sub(r'\bILIKE\b', 'LIKE', sql, flags=re.IGNORECASE)
     sql = re.sub(r'\bltype\b', 'leavetype', sql, flags=re.IGNORECASE)
@@ -440,7 +495,8 @@ def quick_syntax_fix(sql: str) -> str:
         sql,
         flags=re.IGNORECASE
     )
-    
+    if re.search(r'\bWHERE\b.*\bSUM\s*\(', sql, flags=re.IGNORECASE | re.DOTALL):
+        pass
     if re.search(r'SELECT\s+empph\s+FROM', sql, flags=re.IGNORECASE) and \
        not re.search(r'SELECT\s+DISTINCT', sql, flags=re.IGNORECASE):
         sql = re.sub(r'SELECT\s+empph', 'SELECT DISTINCT empph', sql, flags=re.IGNORECASE)
@@ -486,6 +542,15 @@ Columns:
   - work_location: VARCHAR
   - status: INT (0=pending, 1=approved/granted, 2=rejected)
   
+**CRITICAL: "APPLIED FOR" vs "APPLIED ON"**
+1. "applied leave FOR [date]" → Means leave starting on that date
+   - Use `from` column
+   - Example: "how many applied leave FOR today" → WHERE `from` = CURDATE()
+
+2. "applied [ON] [date]" or "who applied today" → Means submission date
+   - Use `applied` column with timezone
+   - Example: "who applied for leave today" → WHERE DATE(CONVERT_TZ(applied, ...)) = CURDATE()
+
 **CRITICAL DISTINCTION: "APPLIED" vs "TOOK" QUERIES:**
 "APPLIED" queries → Use 'applied' column, NO status filter
 - Keywords: "applied", "application", "submitted", "submit"
@@ -498,6 +563,25 @@ Columns:
 - Status: 1 (only approved)
 
 **EXAMPLES:**
+Q: "how many applied leave for today"
+A: SELECT COUNT(*) FROM leaves WHERE `from` = CURDATE();
+(This asks about leaves STARTING today, regardless of when applied)
+
+Q: "how many applied leave for on '2025-12-04'"
+A: SELECT COUNT(*) FROM leaves WHERE `from` = '2025-12-04';
+(This asks about leaves STARTING on this date)
+
+Q: "who applied for leave today"
+A: SELECT empname, empemail FROM leaves WHERE DATE(CONVERT_TZ(applied, '+00:00', '+05:30')) = CURDATE();
+(NO status filter - this asks who SUBMITTED applications today)
+
+Q: "who applied for leave for today"
+A: SELECT empname, empemail FROM leaves WHERE `from` = CURDATE();
+(This asks who applied for leaves that START today)
+
+Q: "how many members applied for leave today"
+A: SELECT COUNT(DISTINCT empname) FROM leaves WHERE DATE(CONVERT_TZ(applied, '+00:00', '+05:30')) = CURDATE();
+(This asks how many people SUBMITTED today)
 
 Q: "who applied for leave in last month"
 WRONG: WHERE `from` <= '2025-11-30' AND `to` >= '2025-11-01' AND status = 1
@@ -513,6 +597,12 @@ RIGHT: SELECT * FROM leaves
 Q: "who took leave in last month"
 RIGHT: SELECT * FROM leaves 
        WHERE `from` <= '2025-11-30' AND `to` >= '2025-11-01' AND status = 1;
+       
+If question contains:
+- "applied" / "application" / "apply" / "applying"
+- "applied for [date]" / "applied leave for [date]"
+
+Then: DO NOT ADD "AND status = ..." to the query!
 
 **CRITICAL STATUS FILTERING RULES:**
 1. "applied"/"application"/"submitted" → NO status filter, use 'applied' column
@@ -557,8 +647,33 @@ DATEDIFF(`to`, `from`) + 1
 EXAMPLES:
 
 Q: "who applied for leave today"
-A: SELECT empname, empemail FROM leaves WHERE DATE(applied) = CURDATE();
-(NO status filter - shows all applications)
+A: SELECT empname, empemail 
+   FROM leaves 
+   WHERE DATE(CONVERT_TZ(applied, '+00:00', '+05:30')) = CURDATE();
+(NO status filter!)
+
+Q: "how many applied leave for today"
+A: SELECT COUNT(*) 
+   FROM leaves 
+   WHERE DATE(CONVERT_TZ(from, '+00:00', '+05:30')) = CURDATE();
+
+Q: "who applied for leave for today"
+A: SELECT empname, empemail, `from`, `to`, leavetype 
+   FROM leaves 
+   WHERE DATE(CONVERT_TZ(from, '+00:00', '+05:30')) = CURDATE();
+(NO status filter!)
+
+Q: "how many members applied for leave today"
+A: SELECT COUNT(DISTINCT empname) 
+   FROM leaves 
+   WHERE DATE(CONVERT_TZ(from, '+00:00', '+05:30')) = CURDATE();
+(NO status filter!)
+
+Q: "list all applications submitted yesterday"
+A: SELECT empname, empemail, `from`, `to`, leavetype, reason
+   FROM leaves
+   WHERE DATE(CONVERT_TZ(applied, '+00:00', '+05:30')) = DATE_SUB(CURDATE(), INTERVAL 1 DAY);
+(NO status filter!)
 
 Q: "who is on leave today"
 A: SELECT empname, empemail FROM leaves WHERE CURDATE() BETWEEN `from` AND `to` AND status = 1;
@@ -589,15 +704,32 @@ def get_schema_for_intent(intent: str) -> str:
 
 def build_llama_prompt(user_question: str, intent: str, context: dict) -> str:
     schema = get_schema_for_intent(intent)
+    print("="*80)
+    print("DEBUG - CONTEXT ANALYSIS")
+    print("="*80)
+    print(f"Question: {user_question}")
+    print(f"Intent: {intent}")
+    print(f"is_application_query: {context.get('is_application_query')}")
+    print(f"check_applied_date: {context.get('check_applied_date')}")
+    print(f"status_filter: {context.get('status_filter')}")
+    print("="*80)
     
     # Build status filter hint
     status_hint = ""
-    if context.get('is_application_query'):
-        status_hint = ""
+    if context.get('is_leave_for_date_query'):
+        status_hint = """CRITICAL: This query asks about leaves FOR a specific date (leave start date).
+                        Use `from` column, NOT 'applied' column.
+                        Example: WHERE `from` = '2025-12-04'
+                        No status filter needed unless specified."""
+    elif context.get('is_application_query'):
+        status_hint = """CRITICAL: This query asks about application SUBMISSION date.
+                        Use 'applied' column with timezone conversion.
+                        Example: WHERE DATE(CONVERT_TZ(applied, '+00:00', '+05:30')) = CURDATE()
+                        NO status filter - show all applications."""
     elif context.get('status_filter') is not None:
         status_hint = f"CRITICAL: Add 'AND status = {context['status_filter']}' to WHERE clause"
-    elif context.get('is_application_query'):
-        status_hint = "CRITICAL: NO status filter needed - show all applications"
+    # elif context.get('is_application_query'):
+    #     status_hint = "CRITICAL: DO NOT ADD STATUS FILTER - This is an application query"
     elif intent == "leaves":
         status_hint = "CRITICAL: Add 'AND status = 1' to WHERE clause (only approved leaves)"
     
@@ -648,28 +780,57 @@ NO STATUS FILTER - show all applications regardless of status"""
             limit_count = top_match.group(1) if top_match else '5'
             agg_type = context.get('aggregation_type', 'sum_days')
             
-            has_period = context.get('has_date_range', False)
+            has_period = context.get('has_date_range', False) or any(period in q_lower for period in ['this month', 'last month', 'this year', 'last week', 'in period'])
+            
+            # Extract period dates if present (these are injected by preprocess_question)
+            period_match = re.search(r"in period '([\d-]+)' to '([\d-]+)'", user_question)
+            period_start = period_match.group(1) if period_match else None
+            period_end = period_match.group(2) if period_match else None
+            
+            # Build the CASE statement for period-aware queries
+            if has_period and period_start and period_end:
+                case_statement = f"""CASE 
+       WHEN `from` >= '{period_start}' AND `to` <= '{period_end}' THEN DATEDIFF(`to`, `from`) + 1
+       WHEN `from` < '{period_start}' AND `to` <= '{period_end}' THEN DATEDIFF(`to`, '{period_start}') + 1
+       WHEN `from` >= '{period_start}' AND `to` > '{period_end}' THEN DATEDIFF('{period_end}', `from`) + 1
+       WHEN `from` < '{period_start}' AND `to` > '{period_end}' THEN DATEDIFF('{period_end}', '{period_start}') + 1
+       ELSE 0
+     END"""
+            else:
+                # No period - simple DATEDIFF
+                case_statement = "DATEDIFF(`to`, `from`) + 1"
             
             if agg_type == 'count':
                 if days_threshold:
                     if has_period:
                         intent_hint = f"""TASK: COUNT employees who took more than {days_threshold} days in given period.
-Use overlapping: WHERE `from` <= 'END_DATE' AND `to` >= 'START_DATE' {status_hint}
-Calculate: SUM(DATEDIFF(`to`, `from`) + 1) AS total_days
-Structure: SELECT COUNT(*) FROM (subquery with GROUP BY and HAVING total_days > {days_threshold})"""
+Use overlapping: WHERE `from` <= '{period_end}' AND `to` >= '{period_start}' AND status = 1
+Calculate: SUM({case_statement}) AS total_days
+Structure: SELECT COUNT(*) FROM (
+  SELECT empemail 
+  FROM leaves 
+  WHERE `from` <= '{period_end}' AND `to` >= '{period_start}' AND status = 1
+  GROUP BY empemail 
+  HAVING SUM({case_statement}) > {days_threshold}
+) AS subquery;"""
                     else:
                         intent_hint = f"""TASK: COUNT employees who took more than {days_threshold} total days.
-{status_hint}
-Structure: SELECT COUNT(*) FROM (SELECT empemail FROM leaves WHERE status=1 GROUP BY empemail HAVING SUM(DATEDIFF(`to`, `from`) + 1) > {days_threshold}) AS subquery;"""
+Structure: SELECT COUNT(*) FROM (
+  SELECT empemail 
+  FROM leaves 
+  WHERE status = 1 
+  GROUP BY empemail 
+  HAVING SUM(DATEDIFF(`to`, `from`) + 1) > {days_threshold}
+) AS subquery;"""
                 else:
-                    intent_hint = f"TASK: COUNT distinct employees. {status_hint}. Use COUNT(DISTINCT empemail)"
+                    intent_hint = f"TASK: COUNT distinct employees. {status_hint}. Use COUNT(DISTINCT empname)"
             
-            elif agg_type == 'top_ranking' or 'top' in q_lower:
+            elif agg_type == 'top_ranking' or 'top' in q_lower or 'most' in q_lower:
                 if has_period:
                     intent_hint = f"""TASK: Find top {limit_count} employees with most leave days in period.
-Use overlapping: WHERE `from` <= 'END_DATE' AND `to` >= 'START_DATE' {status_hint}
-Calculate: SUM(DATEDIFF(`to`, `from`) + 1) AS total_days
-Include: COUNT(*) AS leave_count, total_days
+Use overlapping: WHERE `from` <= '{period_end}' AND `to` >= '{period_start}' AND status = 1
+Calculate: SUM({case_statement}) AS total_days
+Include: empname, empemail, COUNT(*) AS leave_count, total_days
 GROUP BY empname, empemail
 ORDER BY total_days DESC
 LIMIT {limit_count}"""
@@ -677,12 +838,13 @@ LIMIT {limit_count}"""
                     intent_hint = f"""TASK: Find top {limit_count} employees with most total leave days.
 {status_hint}
 Calculate: SUM(DATEDIFF(`to`, `from`) + 1) AS total_days
-Include: COUNT(*) AS leave_count, total_days
+Include: empname, empemail, COUNT(*) AS leave_count, total_days
 GROUP BY empname, empemail
 ORDER BY total_days DESC
 LIMIT {limit_count}"""
             
             else:
+                # Comparison queries (more than, less than, etc.)
                 comparison_operators = {
                     'more than': '>', 'greater than': '>', 'over': '>', 'above': '>',
                     'less than': '<', 'below': '<', 'under': '<', 'fewer than': '<'
@@ -697,8 +859,9 @@ LIMIT {limit_count}"""
                 if days_threshold:
                     if has_period:
                         intent_hint = f"""TASK: Find employees who took {operator} {days_threshold} days in given period.
-Use overlapping: WHERE `from` <= 'END_DATE' AND `to` >= 'START_DATE' {status_hint}
-Calculate: SUM(DATEDIFF(`to`, `from`) + 1) AS total_days
+Use overlapping: WHERE `from` <= '{period_end}' AND `to` >= '{period_start}' AND status = 1
+Calculate: SUM({case_statement}) AS total_days
+Include: empname, empemail, total_days
 GROUP BY empname, empemail
 HAVING total_days {operator} {days_threshold}
 ORDER BY total_days DESC"""
@@ -706,22 +869,23 @@ ORDER BY total_days DESC"""
                         intent_hint = f"""TASK: Find employees who took {operator} {days_threshold} total days.
 {status_hint}
 Calculate: SUM(DATEDIFF(`to`, `from`) + 1) AS total_days
+Include: empname, empemail, total_days
 GROUP BY empname, empemail
 HAVING total_days {operator} {days_threshold}
 ORDER BY total_days DESC"""
                 else:
                     if has_period:
                         intent_hint = f"""TASK: Find employees with most leave days in period.
-Use overlapping: WHERE `from` <= 'END_DATE' AND `to` >= 'START_DATE' {status_hint}
-Calculate: SUM(DATEDIFF(`to`, `from`) + 1) AS total_days
-Include COUNT(*) AS leave_count
+Use overlapping: WHERE `from` <= '{period_end}' AND `to` >= '{period_start}' AND status = 1
+Calculate: SUM({case_statement}) AS total_days
+Include: empname, empemail, COUNT(*) AS leave_count, total_days
 GROUP BY empname, empemail
 ORDER BY total_days DESC"""
                     else:
                         intent_hint = f"""TASK: Find employees with most total leave days.
 {status_hint}
 Calculate: SUM(DATEDIFF(`to`, `from`) + 1) AS total_days
-Include COUNT(*) AS leave_count
+Include: empname, empemail, COUNT(*) AS leave_count, total_days
 GROUP BY empname, empemail
 ORDER BY total_days DESC"""
         
@@ -782,6 +946,7 @@ MYSQL SYNTAX RULES:
 - Generic queries like "latest leave", "recent application" → NO email filter
 - Never use placeholder values like 'employee_email' or 'user@example.com' in WHERE clauses
 
+
 {status_hint}
 {context_hint}
 {intent_hint}
@@ -797,6 +962,20 @@ ESSENTIAL EXAMPLES:
 
 # ==================== APPLICATION QUERIES (NO STATUS FILTER) ====================
 
+Q: "for which date maximum members applied for leave"
+A: SELECT DATE(CONVERT_TZ(applied, '+00:00', '+05:30')) AS application_date, COUNT(*) AS total_applications
+   FROM leaves
+   GROUP BY DATE(CONVERT_TZ(applied, '+00:00', '+05:30'))
+   ORDER BY total_applications DESC
+   LIMIT 1;
+
+Q: "on which day did most employees apply for leave"
+A: SELECT DATE(CONVERT_TZ(applied, '+00:00', '+05:30')) AS date, COUNT(DISTINCT empname) AS members_applied
+   FROM leaves
+   GROUP BY DATE(CONVERT_TZ(applied, '+00:00', '+05:30'))
+   ORDER BY members_applied DESC
+   LIMIT 1;
+   
 Q: "who applied for leave today"
 A: SELECT empname, empemail FROM leaves WHERE DATE(CONVERT_TZ(applied, '+00:00', '+05:30')) = CURDATE();
 
@@ -833,6 +1012,26 @@ A: SELECT empname, empemail, `from`, `to`, leavetype
    LIMIT 1;
 
 # ==================== PERIOD-AWARE QUERIES (WITH CASE STATEMENT) ====================
+
+Q: "give me all leave records of john@example.com where he took leaves for more than 1 day this year"
+A: SELECT empname, `from`, `to`, leavetype, reason,
+  (
+    CASE 
+      WHEN `from` >= '2025-01-01' AND `to` <= '2025-12-31' THEN DATEDIFF(`to`, `from`) + 1
+      WHEN `from` <  '2025-01-01' AND `to` <= '2025-12-31' THEN DATEDIFF(`to`, '2025-01-01') + 1
+      WHEN `from` >= '2025-01-01' AND `to` >  '2025-12-31' THEN DATEDIFF('2025-12-31', `from`) + 1
+      WHEN `from` <  '2025-01-01' AND `to` >  '2025-12-31' THEN DATEDIFF('2025-12-31', '2025-01-01') + 1
+      ELSE 0
+    END
+  ) AS days
+FROM leaves
+WHERE empemail = 'john@example.com'
+  AND `from` <= '2025-12-31'
+  AND `to` >= '2025-01-01'
+  AND status = 1
+HAVING days > 1
+ORDER BY `from` DESC;
+
 
 Q: "who took more leaves in this month"
 A: SELECT empname, 
@@ -989,6 +1188,16 @@ Q: "can john@example.com apply for casual leave"
 A: SELECT cl FROM leavebalance WHERE empemail = 'john@example.com' AND CAST(cl AS DECIMAL(10,2)) > 0;
 Now generate MySQL query for:"""
     
+    print("="*80)
+    print("DEBUG - FINAL PROMPT SENT TO LLM")
+    print("="*80)
+    print("STATUS HINT:")
+    print(repr(status_hint))  # repr shows if it's empty string
+    print("\nFULL SYSTEM PROMPT:")
+    print(system_prompt[:2000])  # First 2000 chars
+    print("="*80)
+    
+
     user_message = f"Question: {user_question}"
 
     return [
@@ -1004,6 +1213,13 @@ def generate_sql(tokenizer, model, messages: list, max_new_tokens: int = 400) ->
         tokenize=False,
         add_generation_prompt=True
     )
+    
+    print("="*80)
+    print("DEBUG - LLM INPUT")
+    print("="*80)
+    print(prompt[-1500:])  # Last 1500 chars of prompt
+    print("="*80)
+    
     inputs = tokenizer(prompt, return_tensors="pt", padding=True).to(model.device)
 
     with torch.no_grad():
@@ -1026,7 +1242,11 @@ def generate_sql(tokenizer, model, messages: list, max_new_tokens: int = 400) ->
         fixed_sql = fixed_sql.rstrip() + ';'
 
     fixed_sql = quick_syntax_fix(fixed_sql)
-
+    print("="*80)
+    print("DEBUG - LLM OUTPUT")
+    print("="*80)
+    print(f"Generated SQL: {fixed_sql}")
+    print("="*80)
     return fixed_sql
 
 # --------------------- LLM REPAIR ---------------------
@@ -1131,162 +1351,275 @@ def run_query(conn, sql: str):
             cursor.close()
 
 # --------------------- VERBALIZATION ---------------------
+def clean_null_values(rows, cols):
+    """Convert NULL values to 0 for numeric columns."""
+    cleaned_rows = []
+    for row in rows:
+        cleaned_row = []
+        for i, val in enumerate(row):
+            col_name = cols[i].lower()
+            # If column name suggests numeric value and value is None, replace with 0
+            if val is None and any(keyword in col_name for keyword in ['days', 'count', 'total', 'balance', 'cl', 'sl', 'co', 'duration']):
+                cleaned_row.append(0)
+            else:
+                cleaned_row.append(val)
+        cleaned_rows.append(tuple(cleaned_row))
+    return cleaned_rows
+
 
 def verbalize_results(tokenizer, model, user_question: str, cols: list, rows: list, intent: str, page_size: int = 3, page_num: int = 1) -> str:
-    # Handle empty results
     if not rows:
         return "No results found for your query."
     
-    # Prepare data for pagination
+    # Handle single value responses (counts, phone numbers, etc.)
+    if len(cols) == 1 and len(rows) == 1:
+        col_name = cols[0]
+        value = rows[0][0]
+        
+        if 'COUNT' in col_name.upper():
+            q_lower = user_question.lower()
+            if 'how many' in q_lower or 'count' in q_lower:
+                entity = 'employees'
+                if 'leaves' in q_lower or 'applications' in q_lower:
+                    entity = 'leave applications'
+                return f"{value} {entity} match your criteria."
+        
+        email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
+        email_match = re.search(email_pattern, user_question)
+        
+        if col_name.lower() in ['empph', 'phone', 'contact']:
+            if email_match:
+                return f"The phone number for {email_match.group()} is: {value}"
+            else:
+                return f"The phone number is: {value}"
+        elif col_name.lower() in ['cl', 'sl', 'co']:
+            return f"The {col_name.upper()} balance is: {value}"
+    
+    # FILTER OUT EMPTY EMPLOYEE RECORDS BEFORE PAGINATION
+    filtered_rows = []
+    for row in rows:
+        row_dict = dict(zip(cols, row))
+        empname = str(row_dict.get('empname', '')).strip()
+        empemail = str(row_dict.get('empemail', '')).strip()
+        
+        # Only include rows with valid employee data
+        if empname or empemail:
+            filtered_rows.append(row)
+    
+    rows = filtered_rows
+    
+    if not rows:
+        return "No valid employee records found matching your criteria."
+    
     total_rows = len(rows)
     start_idx = (page_num - 1) * page_size
     end_idx = min(start_idx + page_size, total_rows)
     paginated_rows = rows[start_idx:end_idx]
-
-    # Format data in a clear way for the LLM
+    
     data_summary = format_data_for_verbalization(cols, paginated_rows, page_num, start_idx)
-
-    # Dynamic token estimation based on data size
-    estimated_tokens = len(paginated_rows) * 200 + 500  # Increased buffer
-    max_tokens = min(estimated_tokens, 2000)
-
-    system_prompt = """You are a helpful assistant that converts database query results into natural, conversational responses.
-
-CRITICAL RULES:
-1. You MUST include EVERY SINGLE ROW provided in the data
-2. Use bullet points or numbered lists for multiple items
-3. Never summarize or skip rows
-4. Dont bias any user using(he or she)
+    
+    estimated_tokens = len(paginated_rows) * 150 + 300
+    max_tokens = min(estimated_tokens, 1500)
+    
+    # ENHANCED SYSTEM PROMPT WITH BETTER CONTEXT AWARENESS
+    system_prompt = """You are a helpful assistant that converts database query results into natural, human-readable responses.
 
 Your task:
-1. Read the user's question carefully
-2. Look at the column names and data provided
-3. Count how many rows there are
-4. Generate a response that mentions EVERY row
-5. Be clear and natural
+1. Analyze the user's question and the data provided
+2. Generate a clear, conversational response that answers the question
+3. Present information in a natural way, avoiding technical jargon
+4. Use proper formatting with bullet points for multiple items
+5. Be concise but complete
+
+**CRITICAL: UNDERSTAND THE QUERY TYPE**
+
+1. **LEAVE BALANCE QUERIES** - When columns include 'cl', 'sl', 'co', or 'total_balance':
+   - These show REMAINING/AVAILABLE leave days
+   - Use phrases: "has X days remaining", "leave balance of X days", "X days available"
+   - NEVER say "took X days" or "applied for X days"
+   - Example: "John has 5.5 days of total leave balance remaining (CL: 2, SL: 2.5, CO: 1)"
+
+2. **LEAVE HISTORY QUERIES** - When columns include 'from', 'to', 'leavetype', 'applied', 'reason':
+   - These show leaves that were TAKEN/APPLIED
+   - Use phrases: "took leave", "applied for leave", "was on leave"
+   - Example: "John took 3 days of sick leave from Nov 1 to Nov 3"
+
+3. **AGGREGATION QUERIES** - When columns include 'total_days', 'leave_count':
+   - These show CUMULATIVE leave taken over a period
+   - Use phrases: "took a total of X days", "applied for X days in total"
+   - Example: "John took a total of 15 days across 3 leave applications this month"
+
+**CRITICAL PAGINATION RULE:**
+- You have been given a SMALL subset of results (typically 3-5 rows)
+- You MUST include ALL rows provided in your response
+- Each row must have its own bullet point
+- Do NOT skip any rows
+- SKIP rows where empname AND empemail are both empty/null
+
+**DATA INTERPRETATION RULES:**
+- If empname is empty but empemail exists, use empemail only
+- If empemail is empty but empname exists, use empname only
+- If BOTH empname and empemail are empty, SKIP that row entirely
+- For leave balance values (cl, sl, co, total_balance): these are REMAINING days, not days taken
+- For date ranges (from, to): these indicate when leave WAS taken
+- For total_days with GROUP BY: this is cumulative days taken over a period
 
 Guidelines:
 - For single results: Give a direct answer
-- For 2+ results: Use bullet points or numbered list, ONE item per row
-- For dates: Format naturally (e.g., "November 15th to 16th")
-- For leave records: Include the date range for each leave period
-- Always be conversational and friendly
+- For multiple results: List them clearly with relevant details (ONE bullet per row)
+- For counts: State the number naturally
+- For dates: Format them in a readable way (e.g., "from November 1st to November 5th")
+- Always include employee names when available
+- For leave balances: Mention the TYPE of balance (remaining/available, not taken)
 
-Examples:
+**CORRECT EXAMPLES:**
 
-Q: "John applied leaves in November"
+Question: "list employees whose leave balance is less than 5"
+Data: 
+Row 1: empname: John, empemail: john@ex.com, total_balance: 3.5
+Row 2: empname: Jane, empemail: jane@ex.com, total_balance: 4.0
+Response: "Here are 2 employees with leave balance less than 5 days:
+
+- John (john@ex.com) has 3.5 days of total leave balance remaining
+- Jane (jane@ex.com) has 4.0 days of total leave balance remaining"
+
+Question: "who has lowest casual leave balance"
+Data: 
+Row 1: empname: John, empemail: john@ex.com, cl: 1.5
+Response: "John (john@ex.com) has the lowest casual leave balance with 1.5 days remaining."
+
+Question: "employees who took more than 5 days this month"
 Data:
-Columns: from, to, leavetype
-from: 2025-11-15, to: 2025-11-15, leavetype: SICK LEAVE
-from: 2025-11-28, to: 2025-11-29, leavetype: CASUAL LEAVE
-Response: "John applied for leave on 2 occasions in November:
-1. Sick leave on November 15th (1 day)
-2. Casual leave from November 28th to 29th (2 days)"
+Row 1: empname: John, empemail: john@ex.com, total_days: 8
+Row 2: empname: Jane, empemail: jane@ex.com, total_days: 6
+Response: "Here are employees who took more than 5 days of leave this month:
 
-Q: "leave balance of jane@example.com"
-Data:
-Columns: cl, sl, co
-cl: 12, sl: 8, co: 3
-Response: "jane@example.com has a leave balance of 12 days Casual Leave (CL), 8 days Sick Leave (SL), and 3 days Comp Off (CO)."
+- John (john@ex.com) took a total of 8 days
+- Jane (jane@ex.com) took a total of 6 days"
 
-Q: "who is on leave today"
-Data:
-Columns: empname, empemail, from, to, leavetype
-empname: John Doe, empemail: john@ex.com, from: 2025-12-01, to: 2025-12-05, leavetype: SICK LEAVE
-empname: Jane Smith, empemail: jane@ex.com, from: 2025-12-02, to: 2025-12-02, leavetype: CASUAL LEAVE
-empname: Bob Lee, empemail: bob@ex.com, from: 2025-12-01, to: 2025-12-03, leavetype: COMP OFF
-Response: "3 employees are on leave today:
-1. John Doe (john@ex.com) - sick leave from December 1st to 5th
-2. Jane Smith (jane@ex.com) - casual leave on December 2nd
-3. Bob Lee (bob@ex.com) - comp off from December 1st to 3rd"
+Question: "Who is on leave today?"
+Data: [['John Doe', 'john@example.com', '2025-11-10', '2025-11-12', 'SICK LEAVE']]
+Response: "John Doe (john@example.com) is currently on sick leave from November 10th to November 12th, 2025."
 
-Q: "for how many days did john@example.com take leave this month"
-Data:
-Columns: total_days
-total_days: 4
-Response: "john@example.com took leave for 4 days this month."
+Question: "show employees with sick leave balance > 5"
+Data: 
+Row 1: empname: John, empemail: john@ex.com, sl: 18
+Row 2: empname: Jane, empemail: jane@ex.com, sl: 12
+Row 3: empname: , empemail: , sl: 8
+Response: "Here are employees with sick leave balance greater than 5 days:
 
-REMEMBER: If data shows N rows, your response MUST mention all N items. Don't skip any!
+- John (john@ex.com) has 18 days of sick leave remaining
+- Jane (jane@ex.com) has 12 days of sick leave remaining"
 
-Now generate a natural response for the following:"""
+**INCORRECT EXAMPLES TO AVOID:**
+
+❌ "John took 3.5 days" (when showing leave BALANCE)
+❌ "Jane applied for 4 days" (when showing leave BALANCE)
+❌ Including rows with empty empname and empemail
+❌ "has 8 days remaining" (when showing TOTAL days taken in a period)
+
+Now convert the following data into a natural response:"""
+
+    # Detect query type for better user message
+    q_lower = user_question.lower()
+    cols_lower = [c.lower() for c in cols]
+    
+    query_type_hint = ""
+    if any(col in cols_lower for col in ['cl', 'sl', 'co', 'total_balance']):
+        if 'total_balance' in cols_lower or ('cl' in cols_lower and 'sl' in cols_lower and 'co' in cols_lower):
+            query_type_hint = "\n**QUERY TYPE: Leave Balance (Remaining Days)**"
+        else:
+            query_type_hint = "\n**QUERY TYPE: Leave Balance (Specific Type)**"
+    elif any(col in cols_lower for col in ['total_days', 'leave_count']) and 'from' not in cols_lower:
+        query_type_hint = "\n**QUERY TYPE: Aggregated Leave History (Total Days Taken)**"
+    elif any(col in cols_lower for col in ['from', 'to', 'leavetype', 'applied']):
+        query_type_hint = "\n**QUERY TYPE: Leave History (Taken/Applied)**"
 
     user_message = f"""Question: {user_question}
+{query_type_hint}
 
-Data:
 {data_summary}
 
-IMPORTANT: There are {len(paginated_rows)} row(s) in the data. Your response MUST include information from ALL {len(paginated_rows)} row(s). Count them and make sure you mention each one."""
+IMPORTANT: 
+1. Include ALL {len(paginated_rows)} rows in your response (one bullet per row)
+2. Skip any rows where BOTH empname and empemail are empty
+3. Use correct terminology based on query type (balance = remaining, history = taken)"""
 
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_message}
     ]
-
-    # Generate response
+    
     prompt = tokenizer.apply_chat_template(
         messages,
         tokenize=False,
         add_generation_prompt=True
     )
-
+    
     inputs = tokenizer(prompt, return_tensors="pt", padding=True).to(model.device)
-
+    
     with torch.no_grad():
         out = model.generate(
             **inputs,
             max_new_tokens=max_tokens,
-            do_sample=True,
-            temperature=0.4,  # Slightly increased from 0.3 for more natural responses
-            top_p=0.92,       # Slightly increased
-            repetition_penalty=1.1,  # Prevent repetition
+            do_sample=False,
+            temperature=0.1,
+            top_p=0.95,
             pad_token_id=tokenizer.pad_token_id,
             eos_token_id=tokenizer.eos_token_id,
         )
-
+    
     generated_ids = out[0][inputs['input_ids'].shape[1]:]
     response = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
-
-    # Clean up common LLM artifacts
-    response = re.sub(r"^(Response:|Answer:|A:|Here's the answer:)\s*", "", response, flags=re.IGNORECASE).strip()
-    response = re.sub(r"^['\"]|['\"]$", "", response).strip()
-
-    # Add pagination info if needed
+    
+    response = re.sub(r"^(Response:|Answer:|A:)\s*", "", response, flags=re.IGNORECASE).strip()
+    
     remaining = total_rows - end_idx
     if remaining > 0:
         response += f"\n\n📄 Showing results {start_idx + 1}-{end_idx} of {total_rows}. ({remaining} more remaining)"
-    elif total_rows > page_size:
-        response += f"\n\n✓ Showing all {total_rows} results (page {page_num}/{(total_rows + page_size - 1) // page_size})."
-
+    else:
+        if total_rows > page_size:
+            response += f"\n\n✓ Showing all {total_rows} results (page {page_num}/{(total_rows + page_size - 1) // page_size})."
+    
     return response
 
+
 def format_data_for_verbalization(cols: list, rows: list, page_num: int = 1, start_idx: int = 0) -> str:
-    """Format database results in a clear, readable way for the LLM."""
+    """Format database results for LLM verbalization."""
     if not rows:
         return "No data"
     
     formatted_lines = [
-        f"Total Rows: {len(rows)}",
+        f"⚠️ CRITICAL: You have {len(rows)} row(s) - MUST include ALL {len(rows)} in response",
         f"Columns: {', '.join(cols)}",
-        ""  # blank line
+        ""
     ]
     
     for i, row in enumerate(rows, start=start_idx + 1):
         row_parts = []
         for col, val in zip(cols, row):
-            # Format the value appropriately
             if val is None:
-                row_parts.append(f"{col}: NULL")
+                if any(keyword in col.lower() for keyword in ['days', 'count', 'total', 'balance', 'cl', 'sl', 'co', 'duration']):
+                    row_parts.append(f"{col}: 0")
+                else:
+                    row_parts.append(f"{col}: None")
             elif isinstance(val, (int, float)):
                 row_parts.append(f"{col}: {val}")
             elif isinstance(val, datetime.datetime):
-                # Format datetime nicely
                 row_parts.append(f"{col}: {val.strftime('%Y-%m-%d %H:%M:%S')}")
             elif isinstance(val, datetime.date):
                 row_parts.append(f"{col}: {val}")
             else:
-                row_parts.append(f"{col}: {val}")
+                # Truncate very long text (like reasons)
+                val_str = str(val)
+                if len(val_str) > 100:
+                    val_str = val_str[:97] + "..."
+                row_parts.append(f"{col}: {val_str}")
         
         formatted_lines.append(f"Row {i}: {', '.join(row_parts)}")
+    
+    formatted_lines.append("")
+    formatted_lines.append(f"⚠️ VERIFY: Count above = {len(rows)} rows. Your response MUST have {len(rows)} items.")
     
     return "\n".join(formatted_lines)
 
