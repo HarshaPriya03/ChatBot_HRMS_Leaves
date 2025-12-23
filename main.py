@@ -3,15 +3,80 @@ from flask import Flask, render_template_string, request, jsonify, session
 from datetime import datetime, timedelta
 import secrets
 import re
+import mysql.connector
+from mysql.connector import Error
 
 from sentence_transformers import SentenceTransformer, util
 import numpy as np
 
 
+DB_CONFIG = {
+    'host': "68.178.155.255",        
+    'user': 'Anika12',             
+    'password': 'Anika12',    
+    'database': 'test_ems'
+    
+}
+
+def get_db_connection():
+    """Create and return MySQL database connection"""
+    try:
+        connection = mysql.connector.connect(**DB_CONFIG)
+        if connection.is_connected():
+            return connection
+    except Error as e:
+        print(f"❌ Error connecting to MySQL: {e}")
+        return None
+
+def get_holidays_in_range(from_date_str, to_date_str):
+    """
+    Fetch holidays from database where status is NULL.
+    Returns set of holiday dates for fast lookup.
+    """
+    try:
+        conn = get_db_connection()
+        if not conn:
+            print("⚠️ Could not connect to database for holidays")
+            return set()
+        
+        cursor = conn.cursor()
+        
+        
+        query = """
+            SELECT date 
+            FROM holiday 
+            WHERE date BETWEEN %s AND %s 
+            AND status IS NULL
+        """
+        
+        cursor.execute(query, (from_date_str, to_date_str))
+        results = cursor.fetchall()
+        
+        holiday_dates = set()
+        for row in results:
+            if row[0]:
+                if isinstance(row[0], str):
+                    holiday_date = datetime.strptime(row[0], '%Y-%m-%d')
+                    holiday_dates.add(holiday_date.date())
+                else:
+                    holiday_dates.add(row[0])
+        
+        cursor.close()
+        conn.close()
+        
+        print(f"✅ Fetched {len(holiday_dates)} holidays from database")
+        return holiday_dates
+        
+    except Error as e:
+        print(f"❌ Database error: {e}")
+        return set()
+    except Exception as e:
+        print(f"❌ Error fetching holidays: {e}")
+        return set()
+
 model_name = "google/flan-t5-large"
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
-
 
 print("Loading semantic model for pattern detection...")
 semantic_model = SentenceTransformer('all-MiniLM-L6-v2')
@@ -120,7 +185,6 @@ CATEGORY_PROTOTYPES = {
     ]
 }
 
-
 print("Precomputing category embeddings...")
 CATEGORY_EMBEDDINGS = {}
 for category, examples in CATEGORY_PROTOTYPES.items():
@@ -139,7 +203,6 @@ def categorize_reason_for_pattern(reason: str) -> str:
     reason_cleaned = reason.strip().lower()
     
     reason_embedding = semantic_model.encode(reason_cleaned, convert_to_tensor=True)
-    
     
     best_category = 'other'
     best_similarity = 0.0
@@ -266,7 +329,6 @@ Respond with exactly one word: sick, casual, or invalid."""
     else:
         return "invalid"
 
-
 def add_kpi_remark(employee_key, remark):
     """Store KPI remarks in session for tracing. employee_key unused for single-user session."""
     if 'kpi_remarks' not in session:
@@ -290,22 +352,18 @@ def is_emergency_leave_ai(reason: str, from_date_str: str = None) -> bool:
     if not reason:
         return False
     
-    
     if from_date_str:
         try:
             from_date = datetime.strptime(from_date_str, '%Y-%m-%d')
             today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
             
-            
             if from_date != today:
                 return False
         except:
-            
             pass
     
     reason_lower = reason.lower().strip()
     
-   
     non_emergency_keywords = [
         'tomorrow', 'next week', 'next month', 'planning', 'scheduled',
         'appointment', 'routine', 'checkup', 'follow-up', 'regular',
@@ -315,11 +373,9 @@ def is_emergency_leave_ai(reason: str, from_date_str: str = None) -> bool:
         'taking care', 'looking after', 'need to help'
     ]
     
-
     for keyword in non_emergency_keywords:
         if keyword in reason_lower:
             return False
-    
     
     non_emergency_patterns = [
         r'i (?:want|need|would like) to',  
@@ -342,11 +398,9 @@ def is_emergency_leave_ai(reason: str, from_date_str: str = None) -> bool:
     
     has_critical_keyword = any(keyword in reason_lower for keyword in critical_keywords)
     
-    
     classification = classify_reason(reason)
     if classification == "sick":
         return False 
-    
     
     prompt = f"""You are an EMERGENCY LEAVE VALIDATOR for a company leave management system.
 
@@ -410,7 +464,6 @@ Your answer (YES or NO only):"""
         result = tokenizer.decode(outputs[0], skip_special_tokens=True).strip().upper()
         
         if "YES" in result and not has_critical_keyword:
-            
             stricter_check = any(word in reason_lower for word in [
                 'accident', 'hospitalized', 'death', 'died', 'critical', 
                 'fracture', 'injured', 'heart attack', 'stroke'
@@ -503,6 +556,118 @@ def is_valid_casual_comp_off_to_date(date_string, from_date_string):
         return to_date >= from_date
     except ValueError:
         return False
+
+def get_excluded_days_info(from_date, to_date):
+    """Get detailed info about excluded days (Sundays and holidays)"""
+    try:
+        start_date = datetime.strptime(from_date, '%Y-%m-%d')
+        end_date = datetime.strptime(to_date, '%Y-%m-%d')
+        
+        # Get holidays with names
+        conn = get_db_connection()
+        if conn:
+            cursor = conn.cursor(dictionary=True)
+            query = """
+                SELECT date, value as name 
+                FROM holiday 
+                WHERE date BETWEEN %s AND %s 
+                AND status IS NULL
+            """
+            cursor.execute(query, (from_date, to_date))
+            holiday_records = cursor.fetchall()
+            cursor.close()
+            conn.close()
+        else:
+            holiday_records = []
+        
+        # Convert to set and list
+        holiday_dates = set()
+        holiday_list = []
+        for record in holiday_records:
+            if record['date']:
+                if isinstance(record['date'], str):
+                    h_date = datetime.strptime(record['date'], '%Y-%m-%d').date()
+                else:
+                    h_date = record['date']
+                holiday_dates.add(h_date)
+                holiday_list.append((h_date, record.get('name', 'Holiday')))
+        
+        # Count Sundays and working days
+        sundays_count = 0
+        working_days = 0
+        current_date = start_date
+        
+        while current_date <= end_date:
+            is_sunday = current_date.weekday() == 6
+            is_holiday = current_date.date() in holiday_dates
+            
+            if is_sunday:
+                sundays_count += 1
+            
+            if not is_sunday and not is_holiday:
+                working_days += 1
+            
+            current_date += timedelta(days=1)
+        
+        calendar_days = (end_date - start_date).days + 1
+        
+        return {
+            'sundays': sundays_count,
+            'holidays': len(holiday_dates),
+            'holiday_list': holiday_list,
+            'working_days': working_days,
+            'calendar_days': calendar_days
+        }
+        
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        return {
+            'sundays': 0,
+            'holidays': 0,
+            'holiday_list': [],
+            'working_days': 0,
+            'calendar_days': 0
+        }
+
+def calculate_days(from_date, to_date):
+    """Calculate working days excluding Sundays AND holidays"""
+    try:
+        start_date = datetime.strptime(from_date, '%Y-%m-%d')
+        end_date = datetime.strptime(to_date, '%Y-%m-%d')
+        
+        # Fetch holidays from database
+        holidays = get_holidays_in_range(from_date, to_date)
+        
+        working_days = 0
+        sundays_count = 0
+        holidays_count = 0
+        current_date = start_date
+        
+        while current_date <= end_date:
+            is_sunday = current_date.weekday() == 6
+            is_holiday = current_date.date() in holidays
+            
+            if is_sunday:
+                sundays_count += 1
+            if is_holiday:
+                holidays_count += 1
+            
+            # Count only if not Sunday and not holiday
+            if not is_sunday and not is_holiday:
+                working_days += 1
+            
+            current_date += timedelta(days=1)
+        
+        # Log calculation
+        calendar_days = (end_date - start_date).days + 1
+        print(f"📅 {calendar_days} calendar days → {working_days} working days")
+        print(f"   Excluded: {sundays_count} Sundays, {holidays_count} Holidays")
+        
+        return working_days
+        
+    except Exception as e:
+        print(f"❌ Error calculating days: {e}")
+        return 0
 
 # ----------------- LEAVE PROCESSING FUNCTIONS -----------------
 
@@ -616,7 +781,6 @@ def check_auto_approval_eligibility(leave_data, balance, is_emergency=False):
                 return (True, f"Partial auto-approval ({approved} of {days} days)", approved, hr_review)
             else:
                 return (False, "No auto-approval days available", 0, days)
-
 
 def process_leave_application(leave_data, balance):
     """
@@ -1084,7 +1248,6 @@ def init_session():
     
     session.modified = True
 
-
 def get_monthly_counters_for_leave(leave_data):
     """
     Get the monthly counters for the month of the leave application.
@@ -1116,7 +1279,6 @@ def get_monthly_counters_for_leave(leave_data):
         monthly_approved = session.get('monthly_auto_approved_by_month', {}).get(current_month, 0)
         monthly_emergency = session.get('monthly_emergency_by_month', {}).get(current_month, 0)
         return (monthly_approved, monthly_emergency, current_month)
-
 
 def update_monthly_counters(leave_month, approved_days=0, is_emergency=False):
     """
@@ -1208,24 +1370,6 @@ def has_date_overlap(new_from_date, new_to_date, applied_leaves):
         return False
     except (ValueError, TypeError):
         return True
-
-def calculate_days(from_date, to_date):
-    """Calculate working days excluding Sundays"""
-    try:
-        start_date = datetime.strptime(from_date, '%Y-%m-%d')
-        end_date = datetime.strptime(to_date, '%Y-%m-%d')
-        
-        working_days = 0
-        current_date = start_date
-        
-        while current_date <= end_date:
-            if current_date.weekday() != 6:
-                working_days += 1
-            current_date += timedelta(days=1)
-        
-        return working_days
-    except:
-        return 0
 
 def calculate_lop_amount(lop_days):
     monthly_salary = session.get('employee_salary', 30000)
@@ -1978,20 +2122,20 @@ Please enter your reason:'''
         
         metrics = f'''📊 Your Performance Metrics:
 
-    📅 Last Month Attendance: {session.get('last_month_attendance', 0)}%
-    💼 Last Month Performance: {session.get('last_month_performance', 0)}%
-    ⏰ Late Minutes Used: {session.get('late_minutes_used', 0)}/120 minutes
-    📈 Last 3 Months Avg Attendance: {session.get('last_3_months_attendance', 0)}%
-    🔍 Pattern Violation: {'Yes' if session.get('leave_pattern_violation', False) else 'No'}
+📅 Last Month Attendance: {session.get('last_month_attendance', 0)}%
+💼 Last Month Performance: {session.get('last_month_performance', 0)}%
+⏰ Late Minutes Used: {session.get('late_minutes_used', 0)}/120 minutes
+📈 Last 3 Months Avg Attendance: {session.get('last_3_months_attendance', 0)}%
+🔍 Pattern Violation: {'Yes' if session.get('leave_pattern_violation', False) else 'No'}
 
-    📆 Monthly Leave Tracking:
-    {current_month_name}:
-    ✅ Auto-approved days used: {current_month_approved}/2
-    🚨 Emergency requests used: {current_month_emergency}/1
+📆 Monthly Leave Tracking:
+{current_month_name}:
+✅ Auto-approved days used: {current_month_approved}/2
+🚨 Emergency requests used: {current_month_emergency}/1
 
-    {next_month_name}:
-    ✅ Auto-approved days used: {next_month_approved}/2
-    🚨 Emergency requests used: {next_month_emergency}/1{remarks_text}'''
+{next_month_name}:
+✅ Auto-approved days used: {next_month_approved}/2
+🚨 Emergency requests used: {next_month_emergency}/1{remarks_text}'''
         
         is_eligible, violations = check_leave_eligibility()
         
@@ -2500,16 +2644,35 @@ Please try again with a proper reason:'''
         today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
         is_past_leave = end_date < today
         
-        if days < calendar_days:
-            if is_past_leave:
-                response['response'] = f"You are applying for {days} working day(s) (excluding Sundays) out of {calendar_days} calendar day(s) from {leave_data['fromDate']} to {message}.\n\n⚠️ Note: This is a past leave application."
-            else:
-                response['response'] = f"You are applying for {days} working day(s) (excluding Sundays) out of {calendar_days} calendar day(s) from {leave_data['fromDate']} to {message}."
+        # Get exclusion info
+        exclusion_info = get_excluded_days_info(leave_data['fromDate'], message)
+        num_sundays = exclusion_info['sundays']
+        num_holidays = exclusion_info['holidays']
+        holiday_list = exclusion_info['holiday_list']
+        
+        # Build exclusion text
+        exclusions = []
+        if num_sundays > 0:
+            exclusions.append(f"{num_sundays} Sunday(s)")
+        if num_holidays > 0:
+            exclusions.append(f"{num_holidays} holiday(s)")
+
+        if exclusions:
+            exclusion_text = " and ".join(exclusions)
+            response_text = f"You are applying for {days} working day(s) out of {calendar_days} calendar day(s).\n\n📅 Date Range: {leave_data['fromDate']} to {message}\n🚫 Excluded: {exclusion_text}"
+            
+            # Show holiday names
+            if holiday_list:
+                response_text += "\n\n🎉 Holidays in your leave period:"
+                for h_date, h_name in holiday_list:
+                    response_text += f"\n   • {h_date.strftime('%d %b')} - {h_name}"
         else:
-            if is_past_leave:
-                response['response'] = f"You are applying for {days} day(s) of leave from {leave_data['fromDate']} to {message}.\n\n⚠️ Note: This is a past leave application."
-            else:
-                response['response'] = f"You are applying for {days} day(s) of leave from {leave_data['fromDate']} to {message}."
+            response_text = f"You are applying for {days} day(s) of leave from {leave_data['fromDate']} to {message}."
+
+        if is_past_leave:
+            response_text += "\n\n⚠️ Note: This is a past leave application."
+
+        response['response'] = response_text
         
         result = process_leave_application(leave_data, balance)
         response.update(result)
