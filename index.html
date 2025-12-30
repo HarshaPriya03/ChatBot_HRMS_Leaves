@@ -1,488 +1,225 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Leave Management Chatbot</title>
-    <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-
-        body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            height: 100vh;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            padding: 20px;
-        }
-
-        .chat-container {
-            background: white;
-            border-radius: 20px;
-            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
-            width: 100%;
-            max-width: 900px;
-            height: 90vh;
-            display: flex;
-            flex-direction: column;
-            overflow: hidden;
-        }
-
-        .chat-header {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            padding: 25px;
-            text-align: center;
-            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
-        }
-
-        .chat-header h1 {
-            font-size: 24px;
-            font-weight: 600;
-            margin-bottom: 5px;
-        }
-
-        .chat-header p {
-            font-size: 14px;
-            opacity: 0.9;
-        }
-
-        .chat-messages {
-            flex: 1;
-            overflow-y: auto;
-            padding: 30px;
-            background: #f8f9fa;
-        }
-
-        .message {
-            margin-bottom: 20px;
-            display: flex;
-            animation: slideIn 0.3s ease-out;
-        }
-
-        @keyframes slideIn {
-            from {
-                opacity: 0;
-                transform: translateY(10px);
-            }
-            to {
-                opacity: 1;
-                transform: translateY(0);
-            }
-        }
-
-        .message.user {
-            justify-content: flex-end;
-        }
-
-        .message-content {
-            max-width: 70%;
-            padding: 15px 20px;
-            border-radius: 18px;
-            line-height: 1.6;
-            word-wrap: break-word;
-        }
-
-        .message.user .message-content {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            border-bottom-right-radius: 4px;
-        }
-
-        .message.bot .message-content {
-            background: white;
-            color: #333;
-            border: 1px solid #e0e0e0;
-            border-bottom-left-radius: 4px;
-            box-shadow: 0 2px 5px rgba(0, 0, 0, 0.05);
-        }
-
-        .message.bot .message-content ul {
-            margin-top: 10px;
-            padding-left: 20px;
-        }
-
-        .message.bot .message-content li {
-            margin-bottom: 8px;
-        }
-
-        .typing-indicator {
-            display: none;
-            padding: 15px 20px;
-            background: white;
-            border-radius: 18px;
-            border-bottom-left-radius: 4px;
-            max-width: 70px;
-            border: 1px solid #e0e0e0;
-        }
-
-        .typing-indicator.active {
-            display: block;
-        }
-
-        .typing-indicator span {
-            height: 10px;
-            width: 10px;
-            background: #667eea;
-            border-radius: 50%;
-            display: inline-block;
-            margin-right: 5px;
-            animation: bounce 1.4s infinite ease-in-out both;
-        }
-
-        .typing-indicator span:nth-child(1) {
-            animation-delay: -0.32s;
-        }
-
-        .typing-indicator span:nth-child(2) {
-            animation-delay: -0.16s;
-        }
-
-        @keyframes bounce {
-            0%, 80%, 100% {
-                transform: scale(0);
-            }
-            40% {
-                transform: scale(1);
-            }
-        }
-
-        .chat-input-container {
-            padding: 25px;
-            background: white;
-            border-top: 1px solid #e0e0e0;
-        }
-
-        .chat-input-wrapper {
-            display: flex;
-            gap: 10px;
-            align-items: center;
-        }
-
-        .chat-input {
-            flex: 1;
-            padding: 15px 20px;
-            border: 2px solid #e0e0e0;
-            border-radius: 25px;
-            font-size: 15px;
-            outline: none;
-            transition: all 0.3s;
-        }
-
-        .chat-input:focus {
-            border-color: #667eea;
-            box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
-        }
-
-        .send-button, .more-button {
-            padding: 15px 30px;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            border: none;
-            border-radius: 25px;
-            cursor: pointer;
-            font-size: 15px;
-            font-weight: 600;
-            transition: all 0.3s;
-            display: flex;
-            align-items: center;
-            gap: 8px;
-        }
-
-        .send-button:hover, .more-button:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
-        }
-
-        .send-button:disabled, .more-button:disabled {
-            opacity: 0.5;
-            cursor: not-allowed;
-            transform: none;
-        }
-
-        .more-button {
-            background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
-            display: none;
-        }
-
-        .more-button.visible {
-            display: flex;
-        }
-
-        .info-badge {
-            display: inline-block;
-            padding: 4px 10px;
-            background: #f0f0f0;
-            border-radius: 12px;
-            font-size: 12px;
-            margin-top: 8px;
-            color: #666;
-        }
-
-        .sql-query {
-            margin-top: 10px;
-            padding: 10px;
-            background: #f8f9fa;
-            border-left: 3px solid #667eea;
-            font-family: 'Courier New', monospace;
-            font-size: 12px;
-            border-radius: 4px;
-            overflow-x: auto;
-        }
-
-        .error-message {
-            background: #fee !important;
-            border-color: #fcc !important;
-            color: #c33 !important;
-        }
-
-        ::-webkit-scrollbar {
-            width: 8px;
-        }
-
-        ::-webkit-scrollbar-track {
-            background: #f1f1f1;
-        }
-
-        ::-webkit-scrollbar-thumb {
-            background: #667eea;
-            border-radius: 4px;
-        }
-
-        ::-webkit-scrollbar-thumb:hover {
-            background: #764ba2;
-        }
-    </style>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Leave Management Chatbot</title>
+  <style>
+    * { margin:0; padding:0; box-sizing:border-box; }
+    body { 
+      font-family: Arial, sans-serif; 
+      background: linear-gradient(135deg,#667eea 0%,#764ba2 100%); 
+      height:100vh; 
+      display:flex; 
+      justify-content:center; 
+      align-items:center; 
+    }
+    .chat-container { 
+      width:90%; 
+      max-width:600px; 
+      height:80vh; 
+      background:white; 
+      border-radius:10px; 
+      box-shadow:0 10px 30px rgba(0,0,0,0.3); 
+      display:flex; 
+      flex-direction:column; 
+      overflow:hidden; 
+    }
+    .chat-header { 
+      background: linear-gradient(135deg,#667eea 0%,#764ba2 100%); 
+      color:white; 
+      padding:20px; 
+      text-align:center; 
+    }
+    .chat-header h1{ 
+      font-size:24px 
+    }
+    .chat-messages { 
+      flex:1; 
+      overflow-y:auto; 
+      padding:20px; 
+      background:#f5f5f5 
+    }
+    .message{ 
+      margin-bottom:15px; 
+      animation:fadeIn .3s 
+    }
+    @keyframes fadeIn { 
+      from{opacity:0; transform:translateY(10px)} 
+      to{opacity:1; transform:translateY(0)} 
+    }
+    .bot-message{ 
+      text-align:left 
+    } 
+    .user-message{ 
+      text-align:right 
+    }
+    .message-content{ 
+      display:inline-block; 
+      padding:12px 18px; 
+      border-radius:18px; 
+      max-width:80%; 
+      word-wrap:break-word 
+    }
+    .bot-message .message-content{ 
+      background:white; 
+      color:#333; 
+      box-shadow:0 2px 5px rgba(0,0,0,0.1) 
+    }
+    .user-message .message-content{ 
+      background:#667eea; 
+      color:white 
+    }
+    .button-group{ 
+      margin-top:10px 
+    }
+    .chat-button{ 
+      display:block; 
+      width:100%; 
+      padding:10px; 
+      margin:5px 0; 
+      background:#667eea; 
+      color:white; 
+      border:none; 
+      border-radius:8px; 
+      cursor:pointer; 
+      font-size:14px 
+    }
+    .chat-button:hover{ 
+      background:#5568d3 
+    }
+    .input-container{ 
+      padding:15px; 
+      background:white; 
+      border-top:1px solid #ddd; 
+      display:none 
+    }
+    .input-container.active{ 
+      display:flex; 
+      gap:10px 
+    }
+    .input-container input{ 
+      flex:1; 
+      padding:12px; 
+      border:1px solid #ddd; 
+      border-radius:25px; 
+      font-size:14px 
+    }
+    .input-container button{ 
+      padding:12px 20px; 
+      background:#667eea; 
+      color:white; 
+      border:none; 
+      border-radius:25px; 
+      cursor:pointer; 
+      font-size:14px 
+    }
+    .input-container button:hover{ 
+      background:#5568d3 
+    }
+  </style>
 </head>
 <body>
-    <div class="chat-container">
-        <div class="chat-header">
-            <h1>🤖 Leave Management Chatbot</h1>
-            <p>Ask me anything about employee leaves and balances</p>
-        </div>
-
-        <div class="chat-messages" id="chatMessages">
-            <div class="message bot">
-                <div class="message-content">
-                    👋 Hello! I'm your Leave Management Assistant. I can help you with:
-                    <ul style="margin-top: 10px;">
-                        <li>Check leave balances (CL, SL, CO)</li>
-                        <li>View leave history and applications</li>
-                        <li>Find who is on leave today</li>
-                        <li>Get employee contact information</li>
-                        <li>And much more!</li>
-                    </ul>
-                    Just ask me a question to get started! 🚀
-                </div>
-            </div>
-            <div class="message bot">
-                <div class="typing-indicator" id="typingIndicator">
-                    <span></span>
-                    <span></span>
-                    <span></span>
-                </div>
-            </div>
-        </div>
-
-        <div class="chat-input-container">
-            <div class="chat-input-wrapper">
-                <input 
-                    type="text" 
-                    class="chat-input" 
-                    id="chatInput" 
-                    placeholder="Type your question here..."
-                    autocomplete="off"
-                >
-                <button class="send-button" id="sendButton">
-                    <span>Send</span>
-                    <span>→</span>
-                </button>
-                <button class="more-button" id="moreButton">
-                    <span>More</span>
-                    <span>↓</span>
-                </button>
-            </div>
-        </div>
+  <div class="chat-container">
+    <div class="chat-header">
+      <h1>Leave Management Chatbot</h1>
+      <p>Your smart assistant for leave applications</p>
     </div>
 
-    <script>
-        const API_URL = 'http://127.0.0.1:5000';
-        const SESSION_ID = 'user_' + Math.random().toString(36).substr(2, 9);
-        
-        const chatMessages = document.getElementById('chatMessages');
-        const chatInput = document.getElementById('chatInput');
-        const sendButton = document.getElementById('sendButton');
-        const moreButton = document.getElementById('moreButton');
-        const typingIndicator = document.getElementById('typingIndicator');
+    <div class="chat-messages" id="chatMessages"></div>
 
-        let hasMoreResults = false;
+    <div class="input-container" id="inputContainer">
+      <input type="text" id="userInput" placeholder="Type your message..." />
+      <button onclick="sendMessage()">Send</button>
+    </div>
+  </div>
 
-        // Add message to chat
-        function addMessage(text, isUser = false, metadata = null) {
-            const messageDiv = document.createElement('div');
-            messageDiv.className = `message ${isUser ? 'user' : 'bot'}`;
-            
-            const contentDiv = document.createElement('div');
-            contentDiv.className = 'message-content';
-            
-            // Convert newlines to <br> and format the text
-            const formattedText = text.replace(/\n/g, '<br>');
-            contentDiv.innerHTML = formattedText;
-            
-            // Add metadata if available (intent, SQL query, etc.)
-            if (metadata) {
-                if (metadata.intent) {
-                    const badge = document.createElement('div');
-                    badge.className = 'info-badge';
-                    badge.textContent = `Intent: ${metadata.intent} (${(metadata.confidence * 100).toFixed(0)}%)`;
-                    contentDiv.appendChild(badge);
-                }
-                
-                if (metadata.sql_query && !isUser) {
-                    const sqlDiv = document.createElement('div');
-                    sqlDiv.className = 'sql-query';
-                    sqlDiv.textContent = metadata.sql_query;
-                    contentDiv.appendChild(sqlDiv);
-                }
-                
-                if (metadata.total_results !== undefined) {
-                    const badge = document.createElement('div');
-                    badge.className = 'info-badge';
-                    badge.textContent = `Total Results: ${metadata.total_results}`;
-                    contentDiv.appendChild(badge);
-                }
-            }
-            
-            messageDiv.appendChild(contentDiv);
-            chatMessages.insertBefore(messageDiv, typingIndicator.parentElement);
-            chatMessages.scrollTop = chatMessages.scrollHeight;
-        }
+  <script>
+    let chatState = 'initial';
+    let leaveData = {};
 
-        // Show/hide typing indicator
-        function setTyping(isTyping) {
-            if (isTyping) {
-                typingIndicator.classList.add('active');
-            } else {
-                typingIndicator.classList.remove('active');
-            }
-            chatMessages.scrollTop = chatMessages.scrollHeight;
-        }
+    function addMessage(text, type, buttons = null) {
+      const messagesDiv = document.getElementById('chatMessages');
+      const messageDiv = document.createElement('div');
+      messageDiv.className = `message ${type}-message`;
+      const contentDiv = document.createElement('div');
+      contentDiv.className = 'message-content';
+      contentDiv.innerHTML = text.replace(/\n/g, '<br>');
+      messageDiv.appendChild(contentDiv);
 
-        // Send message to API
-        async function sendMessage(question) {
-            if (!question.trim()) return;
-
-            // Add user message
-            addMessage(question, true);
-            chatInput.value = '';
-            sendButton.disabled = true;
-            setTyping(true);
-
-            try {
-                const response = await fetch(`${API_URL}/chat`, {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                    },
-                    body: JSON.stringify({
-                        question: question,
-                        session_id: SESSION_ID
-                    })
-                });
-
-                const data = await response.json();
-
-                if (response.ok) {
-                    // Add bot response
-                    addMessage(data.answer, false, {
-                        intent: data.intent,
-                        confidence: data.confidence,
-                        sql_query: data.sql_query,
-                        total_results: data.total_results
-                    });
-
-                    // Update "More" button visibility
-                    hasMoreResults = data.has_more || false;
-                    if (hasMoreResults) {
-                        moreButton.classList.add('visible');
-                    } else {
-                        moreButton.classList.remove('visible');
-                    }
-                } else {
-                    addMessage(`❌ Error: ${data.error}`, false);
-                }
-            } catch (error) {
-                addMessage(`❌ Connection error: ${error.message}`, false);
-            } finally {
-                setTyping(false);
-                sendButton.disabled = false;
-                chatInput.focus();
-            }
-        }
-
-        // Request more results
-        async function requestMore() {
-            moreButton.disabled = true;
-            setTyping(true);
-
-            try {
-                const response = await fetch(`${API_URL}/chat`, {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                    },
-                    body: JSON.stringify({
-                        question: 'more',
-                        session_id: SESSION_ID
-                    })
-                });
-
-                const data = await response.json();
-
-                if (response.ok) {
-                    addMessage(data.answer, false, {
-                        total_results: data.total_results,
-                        page: data.page
-                    });
-
-                    // Update "More" button visibility
-                    hasMoreResults = data.has_more || false;
-                    if (!hasMoreResults) {
-                        moreButton.classList.remove('visible');
-                    }
-                } else {
-                    addMessage(`❌ Error: ${data.error}`, false);
-                }
-            } catch (error) {
-                addMessage(`❌ Connection error: ${error.message}`, false);
-            } finally {
-                setTyping(false);
-                moreButton.disabled = false;
-            }
-        }
-
-        // Event listeners
-        sendButton.addEventListener('click', () => {
-            sendMessage(chatInput.value);
+      if (buttons && buttons.length > 0) {
+        const buttonGroup = document.createElement('div');
+        buttonGroup.className = 'button-group';
+        buttons.forEach(btn => {
+          const button = document.createElement('button');
+          button.className = 'chat-button';
+          button.textContent = btn.text;
+          button.onclick = () => handleButtonClick(btn.action, btn.text);
+          buttonGroup.appendChild(button);
         });
+        contentDiv.appendChild(buttonGroup);
+      }
 
-        moreButton.addEventListener('click', () => {
-            requestMore();
-        });
+      messagesDiv.appendChild(messageDiv);
+      messagesDiv.scrollTop = messagesDiv.scrollHeight;
+    }
 
-        chatInput.addEventListener('keypress', (e) => {
-            if (e.key === 'Enter') {
-                sendMessage(chatInput.value);
-            }
-        });
+    function showInput() {
+      document.getElementById('inputContainer').classList.add('active');
+      document.getElementById('userInput').focus();
+    }
 
-        // Focus input on load
-        chatInput.focus();
-    </script>
+    function hideInput() {
+      document.getElementById('inputContainer').classList.remove('active');
+    }
+
+    function sendMessage() {
+      const input = document.getElementById('userInput');
+      const message = input.value.trim();
+      if (!message) return;
+      addMessage(message, 'user');
+      input.value = '';
+
+      fetch('/process_input', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({message: message, state: chatState, leaveData: leaveData})
+      }).then(res => res.json()).then(data => {
+        chatState = data.state;
+        leaveData = data.leaveData || {};
+        setTimeout(() => {
+          addMessage(data.response, 'bot', data.buttons);
+          if (data.needsInput) showInput(); else hideInput();
+        }, 300);
+      });
+    }
+
+    function handleButtonClick(action, text) {
+      addMessage(text, 'user');
+      fetch('/handle_action', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({action: action, leaveData: leaveData})
+      }).then(res => res.json()).then(data => {
+        chatState = data.state;
+        leaveData = data.leaveData || {};
+        setTimeout(() => {
+          addMessage(data.response, 'bot', data.buttons);
+          if (data.needsInput) showInput(); else hideInput();
+        }, 300);
+      });
+    }
+
+    document.getElementById('userInput').addEventListener('keypress', function(e) {
+      if (e.key === 'Enter') sendMessage();
+    });
+
+    window.onload = function() {
+      fetch('/init').then(res => res.json()).then(data => {
+        addMessage(data.response, 'bot', data.buttons);
+        chatState = data.state;
+      });
+    };
+  </script>
 </body>
 </html>
