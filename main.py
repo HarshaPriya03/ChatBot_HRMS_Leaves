@@ -5,6 +5,7 @@ import secrets
 import re
 import mysql.connector
 from mysql.connector import Error
+import pytz
 
 from sentence_transformers import SentenceTransformer, util
 import numpy as np
@@ -28,6 +29,335 @@ def get_db_connection():
         print(f"❌ Error connecting to MySQL: {e}")
         return None
 
+# ===================== DATABASE FUNCTIONS =====================
+
+def get_employee_balance(emp_email):
+    """Get leave balance from database for specific employee"""
+    try:
+        conn = get_db_connection()
+        if not conn:
+            print("⚠️ Could not connect to database for leave balance")
+            return {'casual': 0, 'sick': 0, 'compOff': 0}
+        
+        cursor = conn.cursor(dictionary=True)
+        query = "SELECT cl, sl, co FROM leavebalance WHERE empemail = %s"
+        cursor.execute(query, (emp_email,))
+        result = cursor.fetchone()
+        
+        cursor.close()
+        conn.close()
+        
+        if result:
+            # Convert string values to float, handle empty strings
+            try:
+                cl = float(result['cl']) if result['cl'] and str(result['cl']).strip() != '' else 0.0
+            except:
+                cl = 0.0
+            try:
+                sl = float(result['sl']) if result['sl'] and str(result['sl']).strip() != '' else 0.0
+            except:
+                sl = 0.0
+            try:
+                co = float(result['co']) if result['co'] and str(result['co']).strip() != '' else 0.0
+            except:
+                co = 0.0
+                
+            return {
+                'casual': cl,
+                'sick': sl,
+                'compOff': co
+            }
+        else:
+            # If employee not found, create default entry
+            print(f"⚠️ Employee {emp_email} not found in leavebalance table")
+            return {'casual': 0, 'sick': 0, 'compOff': 0}
+            
+    except Error as e:
+        print(f"❌ Database error fetching leave balance: {e}")
+        return {'casual': 0, 'sick': 0, 'compOff': 0}
+
+def update_employee_balance(emp_email, casual_days, sick_days, comp_off_days):
+    """Update leave balance in database - handle negative values"""
+    try:
+        conn = get_db_connection()
+        if not conn:
+            print("⚠️ Could not connect to database to update leave balance")
+            return False
+        
+        cursor = conn.cursor()
+        
+        # Check if employee exists in leavebalance table
+        check_query = "SELECT COUNT(*) FROM leavebalance WHERE empemail = %s"
+        cursor.execute(check_query, (emp_email,))
+        count = cursor.fetchone()[0]
+        
+        if count == 0:
+            # Insert new record
+            insert_query = """
+            INSERT INTO leavebalance (empemail, cl, sl, co, lastupdate) 
+            VALUES (%s, %s, %s, %s, NOW())
+            """
+            cursor.execute(insert_query, (emp_email, str(casual_days), str(sick_days), str(comp_off_days)))
+        else:
+            # Update existing record
+            update_query = """
+            UPDATE leavebalance 
+            SET cl = %s, sl = %s, co = %s, lastupdate = NOW()
+            WHERE empemail = %s
+            """
+            cursor.execute(update_query, (str(casual_days), str(sick_days), str(comp_off_days), emp_email))
+        
+        conn.commit()
+        cursor.close()
+        conn.close()
+        print(f"✅ Updated leave balance for {emp_email}: CL={casual_days}, SL={sick_days}, CO={comp_off_days}")
+        return True
+        
+    except Error as e:
+        print(f"❌ Database error updating leave balance: {e}")
+        return False
+
+def insert_leave_record(leave_data, emp_email, status=0, auto_approval_type=None):
+    """Insert leave application into leaves table"""
+    try:
+        conn = get_db_connection()
+        if not conn:
+            print("⚠️ Could not connect to database to insert leave application")
+            return None
+        
+        cursor = conn.cursor()
+        
+        # Get employee details from leavebalance table
+        emp_query = """
+        SELECT empname FROM leavebalance WHERE empemail = %s
+        """
+        cursor.execute(emp_query, (emp_email,))
+        emp_result = cursor.fetchone()
+        emp_name = emp_result[0] if emp_result else "Unknown"
+        
+        # Insert leave application
+        insert_query = """
+        INSERT INTO leaves (
+            empname, leavetype, `from`, `to`, reason, empemail, status,
+            leavebal, leavetype2, work_location, type_of_auto_approval
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """
+        
+        # Determine leave type for database
+        leave_type_db = leave_data.get('leaveType', '')
+        if leave_type_db == 'casual':
+            leave_type_db = 'Casual Leave'
+        elif leave_type_db == 'sick':
+            leave_type_db = 'Sick Leave'
+        elif leave_type_db == 'compOff':
+            leave_type_db = 'Comp Off'
+        
+        # Get current leave balance
+        current_balance = get_employee_balance(emp_email)
+        
+        # Prepare values
+        values = (
+            emp_name,
+            leave_type_db,
+            leave_data.get('fromDate'),
+            leave_data.get('toDate'),
+            leave_data.get('reason', ''),
+            emp_email,
+            status,  # 0=HR Review, 1=Approved, 2=Rejected, 4=Manager Review
+            f"{current_balance['casual']}/{current_balance['sick']}/{current_balance['compOff']}",
+            leave_type_db,  # leavetype2 same as leavetype
+            'Work Location',  # Default work location
+            auto_approval_type  # NEW: 'EMERGENCY' or 'NORMAL' or None
+        )
+        
+        cursor.execute(insert_query, values)
+        leave_id = cursor.lastrowid
+        
+        conn.commit()
+        cursor.close()
+        conn.close()
+        
+        print(f"✅ Inserted leave application ID: {leave_id}, Auto-approval type: {auto_approval_type}")
+        return leave_id
+        
+    except Error as e:
+        print(f"❌ Database error inserting leave application: {e}")
+        return None
+
+def update_leave_status_db(leave_id, status, remarks="", approved_by="", auto_approval_type=None):
+    """Update leave application status in database"""
+    try:
+        conn = get_db_connection()
+        if not conn:
+            print("⚠️ Could not connect to database to update leave status")
+            return False
+        
+        cursor = conn.cursor()
+        
+        if status == 1:  # Approved
+            if auto_approval_type:
+                # Auto-approved with type
+                update_query = """
+                UPDATE leaves 
+                SET status = %s, status1 = %s, aprtime = NOW(), aprname = %s, type_of_auto_approval = %s
+                WHERE ID = %s
+                """
+                cursor.execute(update_query, (status, remarks, approved_by, auto_approval_type, leave_id))
+            else:
+                # Regular approval (not auto-approved)
+                update_query = """
+                UPDATE leaves 
+                SET status = %s, status1 = %s, aprtime = NOW(), aprname = %s
+                WHERE ID = %s
+                """
+                cursor.execute(update_query, (status, remarks, approved_by, leave_id))
+        elif status == 2:  # Rejected
+            update_query = """
+            UPDATE leaves 
+            SET status = %s, status2 = %s, hrtime = NOW(), hrname = %s
+            WHERE ID = %s
+            """
+            cursor.execute(update_query, (status, remarks, approved_by, leave_id))
+        elif status == 0:  # HR Review
+            update_query = """
+            UPDATE leaves 
+            SET status = %s, status1 = %s
+            WHERE ID = %s
+            """
+            cursor.execute(update_query, (status, remarks, leave_id))
+        elif status == 4:  # Manager Review
+            update_query = """
+            UPDATE leaves 
+            SET status = %s, status1 = %s
+            WHERE ID = %s
+            """
+            cursor.execute(update_query, (status, remarks, leave_id))
+        
+        conn.commit()
+        cursor.close()
+        conn.close()
+        
+        print(f"✅ Updated leave ID {leave_id} to status {status}, Auto-approval type: {auto_approval_type}")
+        return True
+        
+    except Error as e:
+        print(f"❌ Database error updating leave status: {e}")
+        return False
+    
+def get_monthly_auto_approved_days(emp_email, month_str):
+    """
+    Get TOTAL DAYS (not count of applications) of auto-approved leaves for a specific month.
+    month_str format: 'YYYY-MM'
+    IMPORTANT: Only count days that were AUTO-APPROVED (status=1 and type_of_auto_approval is not null)
+    """
+    try:
+        conn = get_db_connection()
+        if not conn:
+            print("⚠️ Could not connect to database for monthly auto-approved count")
+            return 0
+        
+        cursor = conn.cursor()
+        
+        query = """
+        SELECT `from`, `to` FROM leaves 
+        WHERE empemail = %s AND status = 1 
+        AND YEAR(`from`) = %s AND MONTH(`from`) = %s
+        AND type_of_auto_approval IS NOT NULL
+        """
+        
+        year, month = month_str.split('-')
+        cursor.execute(query, (emp_email, year, month))
+        results = cursor.fetchall()
+        
+        cursor.close()
+        conn.close()
+        
+        # Calculate total working days
+        total_days = 0
+        for from_date, to_date in results:
+            from_str = from_date.strftime('%Y-%m-%d') if isinstance(from_date, datetime) else str(from_date)
+            to_str = to_date.strftime('%Y-%m-%d') if isinstance(to_date, datetime) else str(to_date)
+            days = calculate_days(from_str, to_str)
+            total_days += days
+        
+        print(f"📊 Total AUTO-APPROVED days in {month_str}: {total_days}")
+        return total_days
+        
+    except Error as e:
+        print(f"❌ Database error getting monthly auto-approved count: {e}")
+        return 0
+
+def get_monthly_emergency_requests(emp_email, month_str):
+    """
+    Get count of emergency REQUESTS (not days) for a specific month.
+    RULE: Only 1 emergency request per month allowed.
+    """
+    try:
+        conn = get_db_connection()
+        if not conn:
+            print("⚠️ Could not connect to database for emergency requests count")
+            return 0
+        
+        cursor = conn.cursor()
+        
+        query = """
+        SELECT COUNT(DISTINCT ID) FROM leaves 
+        WHERE empemail = %s 
+        AND YEAR(`from`) = %s AND MONTH(`from`) = %s
+        AND type_of_auto_approval = 'EMERGENCY'
+        """
+        
+        year, month = month_str.split('-')
+        cursor.execute(query, (emp_email, year, month))
+        count = cursor.fetchone()[0]
+        
+        cursor.close()
+        conn.close()
+        
+        print(f"📊 Emergency REQUESTS in {month_str}: {count}")
+        return count
+        
+    except Error as e:
+        print(f"❌ Database error getting emergency requests: {e}")
+        return 0
+    
+def get_overlapping_leaves(emp_email, from_date_str, to_date_str):
+    """
+    Check for overlapping leave applications in database
+    """
+    try:
+        conn = get_db_connection()
+        if not conn:
+            print("⚠️ Could not connect to database for overlapping leaves")
+            return []
+        
+        cursor = conn.cursor(dictionary=True)
+        
+        query = """
+        SELECT * FROM leaves 
+        WHERE empemail = %s 
+        AND status IN (0, 1, 4)  -- HR Review, Approved, Manager Review
+        AND (
+            (`from` BETWEEN %s AND %s) 
+            OR (`to` BETWEEN %s AND %s)
+            OR (%s BETWEEN `from` AND `to`)
+            OR (%s BETWEEN `from` AND `to`)
+        )
+        """
+        cursor.execute(query, (emp_email, from_date_str, to_date_str, 
+                             from_date_str, to_date_str, from_date_str, 
+                             to_date_str))
+        
+        results = cursor.fetchall()
+        
+        cursor.close()
+        conn.close()
+        return results
+        
+    except Error as e:
+        print(f"❌ Database error getting overlapping leaves: {e}")
+        return []
+
 def get_holidays_in_range(from_date_str, to_date_str):
     """
     Fetch holidays from database where status is NULL.
@@ -40,7 +370,6 @@ def get_holidays_in_range(from_date_str, to_date_str):
             return set()
         
         cursor = conn.cursor()
-        
         
         query = """
             SELECT date 
@@ -73,6 +402,44 @@ def get_holidays_in_range(from_date_str, to_date_str):
     except Exception as e:
         print(f"❌ Error fetching holidays: {e}")
         return set()
+
+def get_recent_leave_patterns(emp_email, days_window=60):
+    """
+    Get recent leave patterns for pattern detection from database
+    Returns list of reasons from last 'days_window' days
+    """
+    try:
+        conn = get_db_connection()
+        if not conn:
+            print("⚠️ Could not connect to database for pattern detection")
+            return []
+        
+        cursor = conn.cursor()
+        
+        cutoff_date = (datetime.now() - timedelta(days=days_window)).strftime('%Y-%m-%d')
+        
+        query = """
+        SELECT reason, `from` 
+        FROM leaves 
+        WHERE empemail = %s 
+        AND `from` >= %s
+        AND status = 1  -- Only approved leaves
+        ORDER BY `from` DESC
+        """
+        
+        cursor.execute(query, (emp_email, cutoff_date))
+        results = cursor.fetchall()
+        
+        cursor.close()
+        conn.close()
+        
+        return results
+        
+    except Error as e:
+        print(f"❌ Database error getting recent leave patterns: {e}")
+        return []
+
+# ===================== AI FUNCTIONS =====================
 
 model_name = "google/flan-t5-large"
 tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -221,9 +588,9 @@ def categorize_reason_for_pattern(reason: str) -> str:
         
     return best_category
 
-def detect_reason_pattern(leave_data, days_window=60, threshold=4):
+def detect_reason_pattern_db(emp_email, leave_data, days_window=60, threshold=3):
     """
-    Enhanced pattern detection using semantic similarity.
+    Enhanced pattern detection using semantic similarity with database.
     
     Returns (pattern_detected: bool, category: str, count: int).
     Only considers casual reasons (per requirement).
@@ -241,34 +608,20 @@ def detect_reason_pattern(leave_data, days_window=60, threshold=4):
     if not category or category == 'other':
         return (False, None, 0)
 
-    count = 1 
-    try:
-        today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-        cutoff = today - timedelta(days=days_window)
+    count = 1  # Start with current request
+    
+    # Get recent leave patterns from database
+    recent_leaves = get_recent_leave_patterns(emp_email, days_window)
+    
+    for past_reason_str, past_date in recent_leaves:
+        if not past_reason_str:
+            continue
+            
+        past_cat = categorize_reason_for_pattern(past_reason_str)
         
-        for entry in session.get('applied_leaves', []):
-            past_reason = entry.get('reason', '') or ''
-            past_cat = entry.get('category')
-            
-            if not past_cat and past_reason:
-                past_cat = categorize_reason_for_pattern(past_reason)
-            
-            if past_cat != category:
-                continue
-                
-            ts_str = entry.get('timestamp') or entry.get('fromDate')
-            if not ts_str:
-                continue
-            try:
-                ts = datetime.strptime(ts_str, '%Y-%m-%d')
-            except:
-                continue
-            if ts >= cutoff:
-                count += 1
-    except Exception as e:
-        print(f"Error in pattern detection: {e}")
-        return (False, category, 0)
-
+        if past_cat == category:
+            count += 1
+    
     return (count > threshold, category, count)
 
 def classify_reason(reason: str) -> str:
@@ -329,17 +682,7 @@ Respond with exactly one word: sick, casual, or invalid."""
     else:
         return "invalid"
 
-def add_kpi_remark(employee_key, remark):
-    """Store KPI remarks in session for tracing. employee_key unused for single-user session."""
-    if 'kpi_remarks' not in session:
-        session['kpi_remarks'] = []
-    session['kpi_remarks'].append({
-        'remark': remark,
-        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    })
-    session.modified = True
-
-def is_emergency_leave_ai(reason: str, from_date_str: str = None) -> bool:
+def is_emergency_leave_ai(reason: str, from_date_str: str = None, leave_type: str = None) -> bool:
     """
     Use AI to detect if reason qualifies as emergency with strict criteria.
     Returns False immediately if from_date is provided and not today (RULE 13).
@@ -349,159 +692,341 @@ def is_emergency_leave_ai(reason: str, from_date_str: str = None) -> bool:
     - Requires IMMEDIATE action TODAY
     - Cannot be planned or scheduled
     """
-    if not reason:
+    if leave_type == 'sick':
+        print(f"❌ Emergency check FAILED: Sick leave cannot be emergency")
+        return False
+    if not reason or len(reason.strip()) < 5:
+        print(f"❌ Emergency check: Reason too short")
         return False
     
+    # FIRST CHECK: If from_date is provided, it MUST be TODAY for emergency
     if from_date_str:
         try:
-            from_date = datetime.strptime(from_date_str, '%Y-%m-%d')
-            today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+            from_date = datetime.strptime(from_date_str, '%Y-%m-%d').date()
+            today = datetime.now().date()
+            
+            print(f"\n{'='*60}")
+            print(f"📅 DATE CHECK FOR EMERGENCY:")
+            print(f"   From Date: {from_date}")
+            print(f"   Today: {today}")
+            print(f"   Dates match: {from_date == today}")
+            print(f"{'='*60}")
             
             if from_date != today:
+                print(f"❌ EMERGENCY CHECK FAILED: From date is not today")
                 return False
-        except:
-            pass
+        except Exception as e:
+            print(f"❌ Error parsing date: {e}")
+            return False
     
     reason_lower = reason.lower().strip()
+    print(f"\n{'='*60}")
+    print(f"🔍 REASON ANALYSIS FOR EMERGENCY:")
+    print(f"   Reason: {reason}")
+    print(f"   Leave Type: {leave_type}")
+    print(f"{'='*60}")
     
-    non_emergency_keywords = [
-        'tomorrow', 'next week', 'next month', 'planning', 'scheduled',
-        'appointment', 'routine', 'checkup', 'follow-up', 'regular',
-        'function', 'wedding', 'marriage', 'ceremony', 'celebration',
-        'travel', 'trip', 'vacation', 'tour', 'visit',
-        'personal work', 'bank work', 'documentation', 'paperwork',
-        'taking care', 'looking after', 'need to help'
+    # ========== IMMEDIATE REJECTION PATTERNS ==========
+    # These patterns are NEVER emergencies (even if date is today)
+    
+    # 1. Marriage/Wedding related (ALWAYS non-emergency)
+    marriage_patterns = [
+        'marriage', 'wedding', 'engagement', 'anniversary',
+        'marriage function', 'wedding ceremony', 'attending marriage',
+        'going to marriage', 'marriage of', 'wedding of',
+        'brother marriage', 'sister marriage', 'friend marriage',
+        'cousin marriage', 'relative marriage', 'family marriage'
     ]
     
-    for keyword in non_emergency_keywords:
-        if keyword in reason_lower:
+    for pattern in marriage_patterns:
+        if pattern in reason_lower:
+            print(f"❌ IMMEDIATE REJECTION: Marriage/wedding related → NOT EMERGENCY")
+            print(f"   Pattern: '{pattern}'")
+            print(f"{'='*60}\n")
             return False
     
-    non_emergency_patterns = [
-        r'i (?:want|need|would like) to',  
-        r'going (?:to|for)', 
-        r'have (?:to|an) (?:go|attend)', 
-        r'(?:mother|father|grandmother|grandfather|wife|husband|son|daughter|friend|relative).{0,20}(?:sick|ill|unwell|not feeling well)',  # Family member sick (not critical)
+    # 2. Travel/Going somewhere (ALWAYS non-emergency)
+    travel_patterns = [
+        'going to', 'going for', 'attending', 'visiting',
+        'travel', 'trip', 'tour', 'vacation', 'holiday',
+        'outstation', 'out of station', 'going out'
     ]
     
-    for pattern in non_emergency_patterns:
-        if re.search(pattern, reason_lower):
+    for pattern in travel_patterns:
+        if pattern in reason_lower:
+            print(f"❌ IMMEDIATE REJECTION: Travel/attending event → NOT EMERGENCY")
+            print(f"   Pattern: '{pattern}'")
+            print(f"{'='*60}\n")
             return False
     
-    critical_keywords = [
-        'accident', 'injured', 'fracture', 'broken',
-        'hospitalized', 'admitted', 'icu', 'critical',
+    # 3. Planned events/functions (ALWAYS non-emergency)
+    planned_patterns = [
+        'function', 'ceremony', 'celebration', 'festival',
+        'party', 'get together', 'reunion', 'gathering',
+        'planned', 'planning', 'scheduled', 'pre-planned',
+        'in advance', 'advance booking', 'booked'
+    ]
+    
+    for pattern in planned_patterns:
+        if pattern in reason_lower:
+            print(f"❌ IMMEDIATE REJECTION: Planned event → NOT EMERGENCY")
+            print(f"   Pattern: '{pattern}'")
+            print(f"{'='*60}\n")
+            return False
+    
+    # 4. Personal work/errands (ALWAYS non-emergency)
+    personal_patterns = [
+        'personal work', 'personal matter', 'personal reason',
+        'personal issue', 'personal commitment', 'personal',
+        'bank work', 'document work', 'paperwork', 'documentation',
+        'appointment', 'meeting', 'work', 'errand', 'shopping'
+    ]
+    
+    for pattern in personal_patterns:
+        if pattern in reason_lower:
+            print(f"❌ IMMEDIATE REJECTION: Personal work → NOT EMERGENCY")
+            print(f"   Pattern: '{pattern}'")
+            print(f"{'='*60}\n")
+            return False
+    
+    # 5. Routine medical (ALWAYS non-emergency)
+    routine_medical_patterns = [
+        'routine checkup', 'regular checkup', 'doctor appointment',
+        'medical appointment', 'dental appointment', 'eye checkup',
+        'follow up', 'follow-up', 'check up', 'check-up'
+    ]
+    
+    for pattern in routine_medical_patterns:
+        if pattern in reason_lower:
+            print(f"❌ IMMEDIATE REJECTION: Routine medical → NOT EMERGENCY")
+            print(f"   Pattern: '{pattern}'")
+            print(f"{'='*60}\n")
+            return False
+    
+    # ========== CRITICAL EMERGENCY PATTERNS ==========
+    # These patterns indicate TRUE emergencies (only if date is today)
+    
+    # 1. Death/Funeral (ALWAYS emergency if date is today)
+    death_patterns = [
         'died', 'death', 'passed away', 'expired', 'funeral',
-        'sudden', 'unexpected', 'emergency room', 'ambulance',
-        'heart attack', 'stroke', 'seizure', 'collapsed'
+        'last rites', 'condolence', 'demise', 'no more',
+        'grandmother died', 'grandfather died', 'father died', 'mother died',
+        'friend died', 'relative died', 'family member died'
     ]
     
-    has_critical_keyword = any(keyword in reason_lower for keyword in critical_keywords)
+    for pattern in death_patterns:
+        if pattern in reason_lower:
+            print(f"✅ CRITICAL EMERGENCY: Death/funeral → EMERGENCY")
+            print(f"   Pattern: '{pattern}'")
+            print(f"{'='*60}\n")
+            return True
     
-    classification = classify_reason(reason)
-    if classification == "sick":
-        return False 
+    # 2. Critical medical emergencies (emergency if date is today)
+    medical_emergency_patterns = [
+        'heart attack', 'stroke', 'serious accident', 'critical condition',
+        'life support', 'icu', 'intensive care', 'emergency surgery',
+        'serious injury', 'fractured', 'broken bone', 'bleeding profusely'
+    ]
     
-    prompt = f"""You are an EMERGENCY LEAVE VALIDATOR for a company leave management system.
+    for pattern in medical_emergency_patterns:
+        if pattern in reason_lower:
+            print(f"✅ CRITICAL EMERGENCY: Medical emergency → EMERGENCY")
+            print(f"   Pattern: '{pattern}'")
+            print(f"{'='*60}\n")
+            return True
+    
+    # 3. Safety/security emergencies (emergency if date is today)
+    safety_emergency_patterns = [
+        'burglary', 'break in', 'robbery', 'theft', 'police called',
+        'fire at home', 'gas leak', 'flooding home', 'electrical fire',
+        'evacuate', 'emergency services', 'ambulance', 'rescue'
+    ]
+    
+    for pattern in safety_emergency_patterns:
+        if pattern in reason_lower:
+            print(f"✅ CRITICAL EMERGENCY: Safety emergency → EMERGENCY")
+            print(f"   Pattern: '{pattern}'")
+            print(f"{'='*60}\n")
+            return True
+    
+    # 4. Transportation emergencies (emergency if date is today)
+    transport_emergency_patterns = [
+        'breakdown while coming', 'breakdown on the way', 'accident on the way',
+        'vehicle accident', 'car crash', 'stranded', 'stuck', 'cannot reach office',
+        'no way to come', 'transport issue', 'road blocked', 'traffic accident'
+    ]
+    
+    for pattern in transport_emergency_patterns:
+        if pattern in reason_lower:
+            print(f"✅ CRITICAL EMERGENCY: Transportation emergency → EMERGENCY")
+            print(f"   Pattern: '{pattern}'")
+            print(f"{'='*60}\n")
+            return True
+    
+    # ========== AI EMERGENCY DETECTION ==========
+    # If none of the above patterns match, use AI to decide
+    
+    prompt = f"""You are an EMERGENCY LEAVE DETECTOR for workplace attendance.
 
-STRICT EMERGENCY CRITERIA - ALL must be true:
-1. UNFORESEEN/SUDDEN - Could NOT have been planned in advance
-2. REQUIRES IMMEDIATE ACTION TODAY - Cannot wait until tomorrow
-3. CRITICAL SITUATION - Serious consequences if not addressed immediately
+Analyze if this leave reason qualifies as an EMERGENCY that requires IMMEDIATE leave TODAY.
 
-TRUE EMERGENCIES (return YES):
-✓ Accidents/injuries requiring immediate medical attention
-✓ Sudden hospitalization (critical condition)
-✓ Death in immediate family
-✓ Natural disasters affecting home/family
-✓ Fire or major property damage
-✓ Medical emergencies (heart attack, stroke, severe trauma)
-✓ Critical family emergency requiring immediate presence
+EMERGENCY means:
+1. UNFORESEEABLE - Could NOT have been known or planned in advance
+2. URGENT - Requires IMMEDIATE action TODAY, cannot wait
+3. CRITICAL - Serious consequences if not addressed immediately
+4. ATTENDANCE-PREVENTING - Physically prevents employee from working TODAY
 
-NOT EMERGENCIES (return NO):
-✗ "I am sick" / "I have fever" → Use sick leave, not emergency
-✗ Routine doctor appointments
-✗ Planned surgeries or medical procedures
-✗ Family functions, weddings, ceremonies
-✗ "My [family] is sick" → Unless critical hospitalization
-✗ Taking care of sick family member → Unless sudden critical condition
-✗ Personal work, bank work, documentation
-✗ Travel plans, trips, vacations
-✗ Any reason that was planned/scheduled in advance
-✗ Reasons with keywords "urgent" or "emergency" but not truly critical
-✗ "Urgent personal work" → Not emergency
-✗ "Emergency family function" → Not emergency
+TRUE EMERGENCIES (only if happening TODAY):
+✓ Death in immediate family TODAY (father/mother/grandparent died TODAY)
+✓ Life-threatening medical emergency TODAY (heart attack, stroke, serious accident)
+✓ Critical home emergency TODAY (fire, flood, burglary, gas leak)
+✓ Transportation failure WHILE COMING to office TODAY
+✓ Natural disaster affecting safety TODAY
 
-KEYWORD ABUSE CHECK:
-If the reason just contains words like "urgent", "emergency", "important" but doesn't describe a CRITICAL UNFORESEEN situation, return NO.
-
-Examples:
-"Accident - broken leg" → YES (unforeseen, immediate)
-"Father sudden heart attack hospitalized" → YES (critical, immediate)
-"Death of grandmother" → YES (unforeseen, immediate)
-"Urgent personal work" → NO (vague, not critical)
-"Emergency - need to attend wedding" → NO (planned event, not critical)
-"My mother is sick, need to take care" → NO (not critical hospitalization)
-"I have fever and emergency" → NO (use sick leave)
-"Urgent doctor appointment" → NO (planned appointment)
-"Emergency family function" → NO (function = planned, not emergency)
+NOT EMERGENCIES (these are NEVER emergencies):
+✗ ANY planned events (weddings, functions, ceremonies, celebrations)
+✗ ANY travel plans (going somewhere, visiting, trips)
+✗ ANY personal work or errands
+✗ ANY routine medical appointments
+✗ ANY family functions or gatherings
+✗ ANY reasons starting with "going to", "attending", "visiting"
+✗ ANY reasons that could have been planned in advance
 
 Reason: "{reason}"
 
-CRITICAL ANALYSIS:
-1. Is this TRULY unforeseen (couldn't be planned)?
-2. Does it require action TODAY (can't wait)?
-3. Is there a CRITICAL situation with serious consequences?
+Is this TRULY an unforeseen, urgent, critical situation requiring immediate leave TODAY?
+If YES → EMERGENCY
+If NO or if it's about attending/going to/traveling → NOT_EMERGENCY
 
-If ALL THREE are YES, respond with: YES
-Otherwise, respond with: NO
-
-Your answer (YES or NO only):"""
+Final decision: [EMERGENCY or NOT_EMERGENCY]"""
 
     try:
         inputs = tokenizer(prompt, return_tensors="pt", max_length=2048, truncation=True)
-        outputs = model.generate(**inputs, max_length=10, temperature=0.0, do_sample=False)
+        outputs = model.generate(
+            **inputs, 
+            max_length=20, 
+            temperature=0.1,
+            do_sample=False,
+            num_beams=3
+        )
         result = tokenizer.decode(outputs[0], skip_special_tokens=True).strip().upper()
         
-        if "YES" in result and not has_critical_keyword:
-            stricter_check = any(word in reason_lower for word in [
-                'accident', 'hospitalized', 'death', 'died', 'critical', 
-                'fracture', 'injured', 'heart attack', 'stroke'
-            ])
-            
-            if not stricter_check:
+        print(f"   AI Result: {result}")
+        
+        emergency_indicators = ["EMERGENCY", "YES", "TRUE", "QUALIFIES", "CRITICAL"]
+        non_emergency_indicators = ["NOT_EMERGENCY", "NO", "FALSE", "DOES NOT", "NON-EMERGENCY"]
+        
+        for indicator in emergency_indicators:
+            if indicator in result:
+                print(f"   ✅ AI Classified as EMERGENCY")
+                print(f"{'='*60}\n")
+                return True
+        
+        for indicator in non_emergency_indicators:
+            if indicator in result:
+                print(f"   ❌ AI Classified as NOT EMERGENCY")
+                print(f"{'='*60}\n")
                 return False
         
-        return "YES" in result
+        print(f"   ⚠️ Unclear AI result, defaulting to NOT EMERGENCY")
+        print(f"{'='*60}\n")
+        return False
         
     except Exception as e:
-        print(f"Error in emergency detection: {e}")
-        return has_critical_keyword
+        print(f"Error in emergency AI detection: {e}")
+        print(f"   Defaulting to NOT EMERGENCY")
+        print(f"{'='*60}\n")
+        return False
 
-# ----------------- DATE VALIDATION FUNCTIONS -----------------
 
-def is_valid_casual_comp_off_from_date(date_string, is_emergency=False):
+# ===================== DATE VALIDATION FUNCTIONS =====================
+
+def is_valid_date_format(date_string):
+    """Check if date is in YYYY-MM-DD format"""
+    try:
+        datetime.strptime(date_string, '%Y-%m-%d')
+        return True
+    except ValueError:
+        return False
+
+def is_valid_casual_comp_off_from_date(date_string, is_emergency=False, leave_type='casual', reason=''):
     """
     Check if FROM date is valid for Casual/Comp Off leave.
     
     Rules:
-    - Emergency: FROM date MUST be TODAY only
-    - Normal Casual: FROM date must be tomorrow or future (one day prior rule)
-    - Comp Off: FROM date must be today or future
+    - Emergency (casual/compOff): FROM date MUST be TODAY only
+    - Normal Casual: FROM date must be tomorrow or future (CANNOT BE TODAY)
+    - Normal Comp Off with CASUAL reason: FROM date must be tomorrow or future (CANNOT BE TODAY)
+    - Normal Comp Off with SICK reason: FROM date CAN be TODAY (like sick leave)
     """
     try:
         input_date = datetime.strptime(date_string, '%Y-%m-%d')
         today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        tomorrow = today + timedelta(days=1)
+        
+        if is_emergency:
+            # Emergency MUST be today only (for both casual and compOff)
+            return input_date == today
+        else:
+            # Check if comp off with sick reason
+            if leave_type == 'compOff' and reason:
+                classification = classify_reason(reason)
+                if classification == 'sick':
+                    # Comp off with sick reason: can be today or future
+                    return input_date >= today
+            
+            # Normal casual/comp off with casual reason: tomorrow or future (CANNOT BE TODAY)
+            return input_date >= tomorrow
+            
+    except ValueError:
+        return False
+
+def validate_compoff_leave_date(date_string, is_emergency=False, reason=''):
+    """
+    Specific validation for comp off leave.
+    
+    Rules:
+    - Emergency comp off: FROM date MUST be TODAY
+    - Comp off with SICK reason: FROM date can be past, today, or future (like sick leave)
+    - Comp off with CASUAL reason: FROM date must be TOMORROW or future (CANNOT BE TODAY)
+    """
+    try:
+        input_date = datetime.strptime(date_string, '%Y-%m-%d')
+        today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        tomorrow = today + timedelta(days=1)
+        
+        print(f"\n{'='*60}")
+        print(f"📅 COMP OFF LEAVE DATE VALIDATION:")
+        print(f"   Input Date: {input_date.date()}")
+        print(f"   Today: {today.date()}")
+        print(f"   Tomorrow: {tomorrow.date()}")
+        print(f"   Is Emergency: {is_emergency}")
         
         if is_emergency:
             # Emergency MUST be today only
-            return input_date == today
+            result = input_date == today
+            print(f"   Emergency check: Date must be today → {result}")
         else:
-            # Normal casual: tomorrow or future (one day prior rule)
-            # Comp off: today or future
-            return input_date >= today
+            # Check reason classification
+            classification = classify_reason(reason) if reason else 'casual'
+            print(f"   Reason Classification: {classification}")
+            
+            if classification == 'sick':
+                # Sick reason: can be past, today, or future (like sick leave)
+                result = input_date <= tomorrow  # Past, today, or tomorrow
+                print(f"   Comp off with SICK reason: Date can be past/today/tomorrow → {result}")
+            else:
+                # Casual reason: must be tomorrow or later (CANNOT BE TODAY)
+                result = input_date >= tomorrow
+                print(f"   Comp off with CASUAL reason: Date must be tomorrow or later (NOT today) → {result}")
+        
+        print(f"   Final Result: {'VALID' if result else 'INVALID'}")
+        print(f"{'='*60}\n")
+        
+        return result
             
     except ValueError:
+        print(f"❌ Invalid date format")
         return False
 
 def validate_casual_leave_date(date_string, is_emergency=False):
@@ -510,22 +1035,38 @@ def validate_casual_leave_date(date_string, is_emergency=False):
     
     Rules:
     - Emergency casual: FROM date MUST be TODAY
-    - Normal casual: FROM date must be TOMORROW or future (applied one day prior)
+    - Normal casual: FROM date must be TOMORROW or future (CANNOT BE TODAY)
     """
     try:
         input_date = datetime.strptime(date_string, '%Y-%m-%d')
         today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
         tomorrow = today + timedelta(days=1)
         
+        print(f"\n{'='*60}")
+        print(f"📅 CASUAL LEAVE DATE VALIDATION:")
+        print(f"   Input Date: {input_date.date()}")
+        print(f"   Today: {today.date()}")
+        print(f"   Tomorrow: {tomorrow.date()}")
+        print(f"   Is Emergency: {is_emergency}")
+        
         if is_emergency:
-            return input_date == today
+            # Emergency MUST be today only
+            result = input_date == today
+            print(f"   Emergency check: Date must be today → {result}")
         else:
-            # Normal casual must be tomorrow or later (one day prior rule)
-            return input_date >= tomorrow
+            # Normal casual must be tomorrow or later (CANNOT BE TODAY)
+            result = input_date >= tomorrow
+            print(f"   Normal casual check: Date must be tomorrow or later (NOT today) → {result}")
+        
+        print(f"   Final Result: {'VALID' if result else 'INVALID'}")
+        print(f"{'='*60}\n")
+        
+        return result
             
     except ValueError:
+        print(f"❌ Invalid date format")
         return False
-
+    
 def is_valid_sick_leave_from_date(date_string):
     """Check if FROM date is valid for sick leave (past dates, today, or tomorrow only)"""
     try:
@@ -556,6 +1097,46 @@ def is_valid_casual_comp_off_to_date(date_string, from_date_string):
         return to_date >= from_date
     except ValueError:
         return False
+
+def calculate_days(from_date, to_date):
+    """Calculate working days excluding Sundays AND holidays"""
+    try:
+        start_date = datetime.strptime(from_date, '%Y-%m-%d')
+        end_date = datetime.strptime(to_date, '%Y-%m-%d')
+        
+        # Fetch holidays from database
+        holidays = get_holidays_in_range(from_date, to_date)
+        
+        working_days = 0
+        sundays_count = 0
+        holidays_count = 0
+        current_date = start_date
+        
+        while current_date <= end_date:
+            is_sunday = current_date.weekday() == 6
+            is_holiday = current_date.date() in holidays
+            
+            if is_sunday:
+                sundays_count += 1
+            if is_holiday:
+                holidays_count += 1
+            
+            # Count only if not Sunday and not holiday
+            if not is_sunday and not is_holiday:
+                working_days += 1
+            
+            current_date += timedelta(days=1)
+        
+        # Log calculation
+        calendar_days = (end_date - start_date).days + 1
+        print(f"📅 {calendar_days} calendar days → {working_days} working days")
+        print(f"   Excluded: {sundays_count} Sundays, {holidays_count} Holidays")
+        
+        return working_days
+        
+    except Exception as e:
+        print(f"❌ Error calculating days: {e}")
+        return 0
 
 def get_excluded_days_info(from_date, to_date):
     """Get detailed info about excluded days (Sundays and holidays)"""
@@ -629,193 +1210,274 @@ def get_excluded_days_info(from_date, to_date):
             'calendar_days': 0
         }
 
-def calculate_days(from_date, to_date):
-    """Calculate working days excluding Sundays AND holidays"""
-    try:
-        start_date = datetime.strptime(from_date, '%Y-%m-%d')
-        end_date = datetime.strptime(to_date, '%Y-%m-%d')
-        
-        # Fetch holidays from database
-        holidays = get_holidays_in_range(from_date, to_date)
-        
-        working_days = 0
-        sundays_count = 0
-        holidays_count = 0
-        current_date = start_date
-        
-        while current_date <= end_date:
-            is_sunday = current_date.weekday() == 6
-            is_holiday = current_date.date() in holidays
-            
-            if is_sunday:
-                sundays_count += 1
-            if is_holiday:
-                holidays_count += 1
-            
-            # Count only if not Sunday and not holiday
-            if not is_sunday and not is_holiday:
-                working_days += 1
-            
-            current_date += timedelta(days=1)
-        
-        # Log calculation
-        calendar_days = (end_date - start_date).days + 1
-        print(f"📅 {calendar_days} calendar days → {working_days} working days")
-        print(f"   Excluded: {sundays_count} Sundays, {holidays_count} Holidays")
-        
-        return working_days
-        
-    except Exception as e:
-        print(f"❌ Error calculating days: {e}")
-        return 0
+# ===================== LEAVE PROCESSING FUNCTIONS =====================
 
-# ----------------- LEAVE PROCESSING FUNCTIONS -----------------
+EMPLOYEE_EMAIL = "putsalaharshapriya@gmail.com"  # Default email, can be changed
 
-def check_auto_approval_eligibility(leave_data, balance, is_emergency=False):
+def check_auto_approval_eligibility_db(emp_email, leave_data, balance, is_emergency=False):
     """
     Central function to check if leave can be auto-approved.
-    FIXED: Now checks quota for the month of leave application, not current month.
-    
-    Returns: (can_auto_approve: bool, reason: str, approved_days: int, hr_days: int)
+    IMPLEMENTING FINAL TABLE RULES:
+    Only 1 emergency auto-approval per month.
     """
     days = leave_data.get('duration', 0)
     leave_type = leave_data.get('leaveType')
     from_date_str = leave_data.get('fromDate')
     
-    # FIXED: Get counters for the leave month, not current month
-    monthly_approved, monthly_emergency, leave_month = get_monthly_counters_for_leave(leave_data)
-    
-    # ========== CALCULATE AVAILABLE BALANCE FOR EACH LEAVE TYPE ==========
-    if leave_type == 'casual':
-        total_balance = balance.get('casual', 0) + balance.get('compOff', 0)
-        available_for_type = total_balance
-    elif leave_type == 'sick':
-        sick_balance = balance.get('sick', 0)
-        casual_balance = balance.get('casual', 0)
-        comp_off_balance = balance.get('compOff', 0)
-        total_balance = sick_balance + casual_balance + comp_off_balance
-        available_for_type = total_balance
-    elif leave_type == 'compOff':
-        total_balance = balance.get('compOff', 0)
-        available_for_type = total_balance
+    # Get leave month for quota tracking
+    if from_date_str:
+        try:
+            from_date = datetime.strptime(from_date_str, '%Y-%m-%d')
+            leave_month = from_date.strftime('%Y-%m')
+        except:
+            leave_month = datetime.now().strftime('%Y-%m')
     else:
-        total_balance = 0
-        available_for_type = 0
+        leave_month = datetime.now().strftime('%Y-%m')
     
-    # ========== RULE 19: LOP is NEVER auto-approved ==========
-    if total_balance == 0 and days > 0:
-        if not is_emergency:
-            return (False, "No leave balance available (LOP cannot be auto-approved)", 0, days)
+    # Get monthly counters from database
+    monthly_approved_days = get_monthly_auto_approved_days(emp_email, leave_month)
+    monthly_emergency_requests = get_monthly_emergency_requests(emp_email, leave_month)
     
-    # ========== CHECK MONTHLY AUTO-APPROVAL LIMITS ==========
-    remaining_monthly = 2 - monthly_approved
+    # Calculate remaining normal auto-approval days
+    remaining_normal_days = 2 - monthly_approved_days
+    
+    print(f"\n{'='*60}")
+    print(f"🔍 AUTO-APPROVAL ELIGIBILITY CHECK:")
+    print(f"   Leave Type: {leave_type}")
+    print(f"   Is Emergency: {is_emergency}")
+    print(f"   Days Requested: {days}")
+    print(f"   Monthly approved days: {monthly_approved_days}/2")
+    print(f"   Remaining normal days: {remaining_normal_days}")
+    print(f"   Emergency requests used: {monthly_emergency_requests}/1")
+    print(f"{'='*60}\n")
     
     # ========== EMERGENCY LEAVE LOGIC ==========
     if is_emergency:
-        # RULE 9-10: Only 1 emergency request per month
-        if monthly_emergency >= 1:
-            return (False, f"Emergency quota exhausted for {leave_month} (1 per month)", 0, days)
-        
         # RULE 12-13: Emergency FROM date must be TODAY
         if from_date_str:
             try:
-                from_date = datetime.strptime(from_date_str, '%Y-%m-%d')
+                from_date = datetime.strptime(from_date_str,'%Y-%m-%d')
                 today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
                 if from_date != today:
                     return (False, "Emergency leave FROM date must be TODAY", 0, days)
             except:
                 return (False, "Invalid FROM date format", 0, days)
         
-        # RULE 20: Emergency with LB=0 can auto-approve 1 day
-        if total_balance == 0:
-            if days == 1:
-                return (True, "Emergency override with no balance (1 day)", 1, 0)
-            elif days > 1:
-                return (True, "Emergency override (1 day approved, rest to HR)", 1, days - 1)
-        
-        # RULE 14-17: Emergency Auto-Approval Logic
-        if remaining_monthly > 0:
-            approved = min(days, remaining_monthly, available_for_type)
-            hr_review = days - approved
-            return (True, f"Emergency auto-approved ({approved} days within monthly limit)", approved, hr_review)
+        # Calculate total available balance for this leave type
+        if leave_type == 'casual':
+            casual_balance = balance.get('casual', 0)
+            comp_off_balance = balance.get('compOff', 0)
+            total_balance = casual_balance + comp_off_balance
+        elif leave_type == 'sick':
+            sick_balance = balance.get('sick', 0)
+            casual_balance = balance.get('casual', 0)
+            comp_off_balance = balance.get('compOff', 0)
+            total_balance = sick_balance + casual_balance + comp_off_balance
+        elif leave_type == 'compOff':
+            total_balance = balance.get('compOff', 0)
         else:
-            approved = min(1, available_for_type)
-            hr_review = days - approved
-            return (True, "Emergency override (1 day approved)", approved, hr_review)
+            total_balance = 0
+        
+        print(f"   Total balance available: {total_balance}")
+        
+        # ========== CHECK EMERGENCY REQUEST LIMIT ==========
+        # RULE: Only 1 emergency request per month allowed
+        if monthly_emergency_requests >= 1:
+            return (False, f"Emergency request limit exhausted for {leave_month} (max 1 emergency request per month)", 0, days)
+        
+        # ========== IMPLEMENT FINAL TABLE RULES ==========
+        # Based on the table: Auto-approved days used | Emergency days applied | Auto-approved | Sent to HR
+        
+        # Case 1: No auto-approved days used yet (0 used)
+        if monthly_approved_days == 0:
+            if days == 1:
+                # 0 used, 1 emergency day → 1 auto-approved, 0 to HR
+                approved = min(1, total_balance if total_balance > 0 else 1)  # Allow LOP if no balance
+                hr_review = 0
+                return (True, "Emergency auto-approved (1 day)", approved, hr_review)
+            elif days == 2:
+                # 0 used, 2 emergency days → 2 auto-approved, 0 to HR
+                approved = min(2, total_balance if total_balance > 0 else 2)
+                hr_review = 0
+                return (True, "Emergency auto-approved (2 days)", approved, hr_review)
+            elif days >= 3:
+                # 0 used, 3+ emergency days → 2 auto-approved, remaining to HR
+                approved = min(2, total_balance if total_balance > 0 else 2)
+                hr_review = days - approved
+                return (True, f"Emergency partial auto-approved ({approved} days)", approved, hr_review)
+        
+        # Case 2: 1 auto-approved day already used
+        elif monthly_approved_days == 1:
+            if days == 1:
+                # 1 used, 1 emergency day → 1 auto-approved, 0 to HR
+                approved = min(1, total_balance if total_balance > 0 else 1)
+                hr_review = 0
+                return (True, "Emergency auto-approved (1 day)", approved, hr_review)
+            elif days == 2:
+                # 1 used, 2 emergency days → 1 auto-approved, 1 to HR
+                approved = min(1, total_balance if total_balance > 0 else 1)
+                hr_review = days - approved
+                return (True, "Emergency partial auto-approved (1 day)", approved, hr_review)
+            elif days >= 3:
+                # 1 used, 3+ emergency days → 1 auto-approved, remaining to HR
+                approved = min(1, total_balance if total_balance > 0 else 1)
+                hr_review = days - approved
+                return (True, "Emergency partial auto-approved (1 day)", approved, hr_review)
+        
+        # Case 3: 2 auto-approved days already used (FULL quota used)
+        elif monthly_approved_days >= 2:
+            # Emergency override: can approve 1 day as bonus
+            if days == 1:
+                # 2 used, 1 emergency day → 1 override auto-approved, 0 to HR
+                approved = 1  # Emergency override always 1 day
+                hr_review = 0
+                return (True, "Emergency override auto-approved (1 day bonus)", approved, hr_review)
+            elif days == 2:
+                # 2 used, 2 emergency days → 1 override auto-approved, 1 to HR
+                approved = 1
+                hr_review = days - approved
+                return (True, "Emergency override partial auto-approved (1 day bonus)", approved, hr_review)
+            elif days >= 3:
+                # 2 used, 3+ emergency days → 1 override auto-approved, remaining to HR
+                approved = 1
+                hr_review = days - approved
+                return (True, "Emergency override partial auto-approved (1 day bonus)", approved, hr_review)
     
     # ========== NORMAL LEAVE LOGIC ==========
     else:
-        # RULE 3: Once 2 days are auto-approved IN THAT MONTH, no further normal leave auto-approval
-        if monthly_approved >= 2:
+        # RULE 1: Monthly auto-approval limit
+        if monthly_approved_days >= 2:
             return (False, f"Monthly auto-approval limit exhausted for {leave_month} (2 days)", 0, days)
+        
+        # Calculate remaining normal auto-approval days
+        remaining_normal_days = 2 - monthly_approved_days
+        
+        # RULE 19: LOP is NEVER auto-approved for normal leave
+        # Calculate available balance for the specific leave type
+        if leave_type == 'casual':
+            available_balance = balance.get('casual', 0)
+            can_use_comp_off = balance.get('compOff', 0)
+            total_available = available_balance + can_use_comp_off
+        elif leave_type == 'sick':
+            available_balance = balance.get('sick', 0)
+            can_use_comp_off = balance.get('compOff', 0)
+            can_use_casual = balance.get('casual', 0)
+            total_available = available_balance + can_use_comp_off + can_use_casual
+        elif leave_type == 'compOff':
+            total_available = balance.get('compOff', 0)
+        else:
+            total_available = 0
+        
+        # RULE 19: Check if we have ANY balance (including from other types)
+        if total_available <= 0:
+            return (False, "No leave balance available (LOP cannot be auto-approved)", 0, days)
         
         # RULE 4-5: Check eligibility violations
         is_eligible, violations = check_leave_eligibility()
         if not is_eligible:
             return (False, "Eligibility violations: " + "; ".join(violations), 0, days)
         
-        # RULE 24-26: Check pattern abuse using SEMANTIC pattern detection
-        pattern_detected, pattern_category, pattern_count = detect_reason_pattern(
-            leave_data, days_window=60, threshold=3
+        # RULE 24-26: Pattern abuse detection
+        pattern_detected, pattern_category, pattern_count = detect_reason_pattern_db(
+            emp_email, leave_data, days_window=60, threshold=3
         )
         if pattern_detected:
-            add_kpi_remark(None, f"Semantic pattern abuse detected: {pattern_category} ({pattern_count} times)")
+            add_kpi_remark_db(emp_email, f"Semantic pattern abuse detected: {pattern_category} ({pattern_count} times)")
             return (False, f"Pattern abuse detected ({pattern_category} - {pattern_count} occurrences)", 0, days)
         
-        # RULE 22: Normal leave auto-approval for 1 or 2 days
-        # RULE 23: For 3+ days, partial auto-approval possible
+        # RULE 22-23: Normal leave auto-approval
         if days <= 2:
-            if available_for_type >= days:
-                approved = min(days, remaining_monthly)
+            # Check if we have enough balance in the PRIMARY leave type first
+            if leave_type == 'casual' and balance['casual'] >= days:
+                approved = min(days, remaining_normal_days, balance['casual'])
                 hr_review = days - approved
-                if hr_review > 0:
-                    return (True, "Partial auto-approval", approved, hr_review)
-                else:
-                    return (True, "Full auto-approval", approved, 0)
+                return (True, f"Casual Leave auto-approved ({approved} days)", approved, hr_review)
+            elif leave_type == 'sick' and balance['sick'] >= days:
+                approved = min(days, remaining_normal_days, balance['sick'])
+                hr_review = days - approved
+                return (True, f"Sick Leave auto-approved ({approved} days)", approved, hr_review)
+            elif leave_type == 'compOff' and balance['compOff'] >= days:
+                approved = min(days, remaining_normal_days, balance['compOff'])
+                hr_review = days - approved
+                return (True, f"Comp Off auto-approved ({approved} days)", approved, hr_review)
             else:
-                return (False, f"Insufficient leave balance (available: {available_for_type}, needed: {days})", 0, days)
+                # Not enough in primary type, check total available
+                if total_available >= days:
+                    approved = min(days, remaining_normal_days, total_available)
+                    hr_review = days - approved
+                    return (True, f"Partial auto-approval using available balances ({approved} days)", approved, hr_review)
+                else:
+                    # Not enough total balance
+                    return (False, f"Insufficient leave balance (available: {total_available}, needed: {days})", 0, days)
         else:
-            approved = min(2, remaining_monthly, available_for_type)
+            # For 3+ days, partial approval up to 2 days
+            approved = min(2, remaining_normal_days, total_available)
             hr_review = days - approved
             if approved > 0:
                 return (True, f"Partial auto-approval ({approved} of {days} days)", approved, hr_review)
             else:
                 return (False, "No auto-approval days available", 0, days)
 
-def process_leave_application(leave_data, balance):
+def process_leave_application(emp_email, leave_data):
     """
-    Main function to process leave applications.
-    FIXED: Now uses leave month for quota tracking.
+    Main function to process leave applications with database.
+    This function ONLY determines eligibility and returns response.
+    It does NOT insert into database until final decision.
     """
+    # Get current leave balance from database
+    balance = get_employee_balance(emp_email)
+    
     leave_type = leave_data.get('leaveType')
     days = leave_data.get('duration', 0)
     reason = leave_data.get('reason', '')
     from_date_str = leave_data.get('fromDate')
-    
-    # Get the month of the leave for quota tracking
-    monthly_approved, monthly_emergency, leave_month = get_monthly_counters_for_leave(leave_data)
+    to_date_str = leave_data.get('toDate')
     
     # ========== DETECT IF EMERGENCY ==========
-    is_emergency = False
-    if from_date_str:
-        is_emergency = is_emergency_leave_ai(reason, from_date_str)
+    is_emergency = leave_data.get('isEmergency', False)
+    if not is_emergency and from_date_str:
+        is_emergency = is_emergency_leave_ai(reason, from_date_str, leave_type)
+        leave_data['isEmergency'] = is_emergency
+        
+    print(f"\n{'='*60}")
+    print(f"🔍 PROCESSING LEAVE APPLICATION:")
+    print(f"   Leave Type: {leave_type}")
+    print(f"   Days: {days}")
+    print(f"   Reason: {reason}")
+    print(f"   From: {from_date_str}")
+    print(f"   To: {to_date_str}")
+    print(f"   Is Emergency: {is_emergency}")
+    print(f"{'='*60}\n")
     
     # ========== CHECK AUTO-APPROVAL ELIGIBILITY ==========
-    can_auto_approve, reason_msg, approved_days, hr_days = check_auto_approval_eligibility(
-        leave_data, balance, is_emergency
+    can_auto_approve, reason_msg, approved_days, hr_days = check_auto_approval_eligibility_db(
+        emp_email, leave_data, balance, is_emergency
     )
+    
+    # ========== GET MONTHLY COUNTERS ==========
+    if from_date_str:
+        try:
+            from_date = datetime.strptime(from_date_str, '%Y-%m-%d')
+            leave_month = from_date.strftime('%Y-%m')
+        except:
+            leave_month = datetime.now().strftime('%Y-%m')
+    else:
+        leave_month = datetime.now().strftime('%Y-%m')
+    
+    monthly_approved = get_monthly_auto_approved_days(emp_email, leave_month)
+    monthly_emergency = get_monthly_emergency_requests(emp_email, leave_month)
     
     # ========== CHECK MONTHLY AUTO-APPROVAL LIMIT ==========
     if monthly_approved >= 2 and not is_emergency:
-        return handle_monthly_limit_exhausted(leave_data, balance, is_emergency)
+        return handle_monthly_limit_exhausted_db(emp_email, leave_data, balance, is_emergency)
     
     if not can_auto_approve:
         if "Monthly auto-approval limit exhausted" in reason_msg:
-            return handle_monthly_limit_exhausted(leave_data, balance, is_emergency)
-        elif "Insufficient" in reason_msg:
-            return suggest_alternative_leaves(leave_data, balance, is_emergency)
+            return handle_monthly_limit_exhausted_db(emp_email, leave_data, balance, is_emergency)
+        elif "Insufficient" in reason_msg or "No leave balance available" in reason_msg:
+            return suggest_alternative_leaves_db(emp_email, leave_data, balance, is_emergency)
         elif "Pattern abuse" in reason_msg:
-            pattern_detected, pattern_category, pattern_count = detect_reason_pattern(leave_data)
+            pattern_detected, pattern_category, pattern_count = detect_reason_pattern_db(emp_email, leave_data)
             return {
                 'response': f'''⚠️ Your leave cannot be auto-approved due to PATTERN ABUSE.
                 
@@ -854,108 +1516,799 @@ Your leave application will be sent to {recipient} for review.''',
     # ========== AUTO-APPROVE LOGIC ==========
     if approved_days > 0:
         # Determine which leave type(s) to use
+        new_balance = balance.copy()
+        used_parts = []
+        
+        # Calculate total available balance
         if leave_type == 'casual':
-            casual_available = balance['casual']
-            casual_used = min(casual_available, approved_days)
-            comp_off_used = approved_days - casual_used
-            
-            if casual_used > 0:
-                balance['casual'] -= casual_used
-            if comp_off_used > 0:
-                balance['compOff'] -= comp_off_used
-            
-            used_type = f'{casual_used} Casual Leave'
-            if comp_off_used > 0:
-                used_type += f' + {comp_off_used} Comp Off'
-                
+            total_balance = balance['casual'] + balance['compOff']
         elif leave_type == 'sick':
+            total_balance = balance['sick'] + balance['compOff'] + balance['casual']
+        elif leave_type == 'compOff':
+            total_balance = balance['compOff']
+        else:
+            total_balance = 0
+        
+        # Handle emergency with negative or zero balance
+        if is_emergency and total_balance <= 0:
+            # Emergency with no balance: 1 day auto-approved with LOP
+            if leave_type == 'casual':
+                used_parts.append(f"-1 Casual Leave (LOP)")
+                new_balance['casual'] = balance['casual'] - 1
+            elif leave_type == 'sick':
+                used_parts.append(f"-1 Sick Leave (LOP)")
+                new_balance['sick'] = balance['sick'] - 1
+            elif leave_type == 'compOff':
+                used_parts.append(f"-1 Casual Leave (LOP)")
+                new_balance['casual'] = balance['casual'] - 1
+            
+            used_type = "Emergency Override with LOP"
+            
+        else:
+            # Normal balance logic
+            remaining_to_approve = approved_days
+            
+            if leave_type == 'casual':
+                # Use casual first
+                casual_used = min(balance['casual'], remaining_to_approve)
+                if casual_used > 0:
+                    used_parts.append(f"{casual_used} Casual Leave")
+                    new_balance['casual'] -= casual_used
+                    remaining_to_approve -= casual_used
+                
+                # Then comp-off
+                if remaining_to_approve > 0:
+                    comp_off_used = min(balance['compOff'], remaining_to_approve)
+                    if comp_off_used > 0:
+                        used_parts.append(f"{comp_off_used} Comp Off")
+                        new_balance['compOff'] -= comp_off_used
+                        remaining_to_approve -= comp_off_used
+                
+            elif leave_type == 'sick':
+                # Use sick first
+                sick_used = min(balance['sick'], remaining_to_approve)
+                if sick_used > 0:
+                    used_parts.append(f"{sick_used} Sick Leave")
+                    new_balance['sick'] -= sick_used
+                    remaining_to_approve -= sick_used
+                
+                # Then comp-off
+                if remaining_to_approve > 0:
+                    comp_off_used = min(balance['compOff'], remaining_to_approve)
+                    if comp_off_used > 0:
+                        used_parts.append(f"{comp_off_used} Comp Off")
+                        new_balance['compOff'] -= comp_off_used
+                        remaining_to_approve -= comp_off_used
+                
+                # Then casual
+                if remaining_to_approve > 0:
+                    casual_used = min(balance['casual'], remaining_to_approve)
+                    if casual_used > 0:
+                        used_parts.append(f"{casual_used} Casual Leave")
+                        new_balance['casual'] -= casual_used
+                        remaining_to_approve -= casual_used
+                
+            elif leave_type == 'compOff':
+                # Use comp-off only
+                comp_off_used = min(balance['compOff'], remaining_to_approve)
+                if comp_off_used > 0:
+                    used_parts.append(f"{comp_off_used} Comp Off")
+                    new_balance['compOff'] -= comp_off_used
+                    remaining_to_approve -= comp_off_used
+            
+            # If still remaining (shouldn't happen with proper checks), handle as LOP
+            if remaining_to_approve > 0:
+                if leave_type == 'casual':
+                    used_parts.append(f"-{remaining_to_approve} Casual Leave (LOP)")
+                    new_balance['casual'] -= remaining_to_approve
+                elif leave_type == 'sick':
+                    used_parts.append(f"-{remaining_to_approve} Sick Leave (LOP)")
+                    new_balance['sick'] -= remaining_to_approve
+                elif leave_type == 'compOff':
+                    used_parts.append(f"-{remaining_to_approve} Casual Leave (LOP)")
+                    new_balance['casual'] -= remaining_to_approve
+            
+            used_type = " + ".join(used_parts)
+        
+        # ========== CRITICAL CHANGE: AUTO-APPROVE IMMEDIATELY ==========
+        # Auto-approve the eligible days automatically (no user confirmation needed)
+        
+        # Update leave balance in database for auto-approved days
+        update_employee_balance(emp_email, new_balance['casual'], 
+                              new_balance['sick'], new_balance['compOff'])
+        
+        # Insert leave application with approved status for auto-approved days
+        status = 1  # Approved
+        auto_approval_type = 'EMERGENCY' if is_emergency else 'NORMAL'
+        
+        # Create a copy of leave_data for auto-approved portion
+        if hr_days > 0:
+            # Partial auto-approval: Create separate leave for auto-approved days
+            auto_approved_data = leave_data.copy()
+            auto_approved_data['duration'] = approved_days
+            leave_id = insert_leave_record(auto_approved_data, emp_email, status, auto_approval_type)
+            
+            if leave_id:
+                remarks = f"Auto-approved {approved_days} day(s) using {used_type}"
+                update_leave_status_db(leave_id, status, remarks, "SYSTEM", auto_approval_type)
+                
+                # Store remaining days for HR/Manager review
+                session['remaining_leave_data'] = leave_data
+                session['remaining_days'] = hr_days
+                session['already_approved_days'] = approved_days
+                
+                # Build response message
+                recipient = "HR" if is_emergency else "Manager/HR"
+                
+                response_msg = f'''✅ {approved_days} day(s) have been auto-approved using {used_type}!
+
+The remaining {hr_days} day(s) require {recipient} approval.
+
+Your updated leave balance:
+📅 Casual Leave: {new_balance['casual']} days
+🏥 Sick Leave: {new_balance['sick']} days
+⏰ Comp Off: {new_balance['compOff']} days
+
+📊 Monthly auto-approved days used for {leave_month}: {monthly_approved + approved_days}/2'''
+                
+                if is_emergency:
+                    response_msg += f"\n🚨 Emergency requests used for {leave_month}: {monthly_emergency + 1}/1"
+                
+                # Add LOP warning if any balance is negative
+                lop_details = []
+                if new_balance['casual'] < 0:
+                    lop_days = abs(new_balance['casual'])
+                    lop_amount = calculate_lop_amount(lop_days)
+                    lop_details.append(f"{lop_days} day(s) Casual Leave (₹{lop_amount} LOP)")
+                
+                if new_balance['sick'] < 0:
+                    lop_days = abs(new_balance['sick'])
+                    lop_amount = calculate_lop_amount(lop_days)
+                    lop_details.append(f"{lop_days} day(s) Sick Leave (₹{lop_amount} LOP)")
+                
+                if lop_details:
+                    response_msg += f"\n\n⚠️ Loss of Pay will be deducted: " + ", ".join(lop_details)
+                
+                response_msg += f"\n\nDo you want to submit the remaining {hr_days} day(s) for {recipient} approval?"
+                
+                return {
+                    'response': response_msg,
+                    'buttons': [
+                        {'text': f'Submit for {recipient} Approval', 'action': 'submitRemainingForApproval'},
+                        {'text': 'Cancel Leave', 'action': 'cancelLeave'}
+                    ],
+                    'state': 'waitingDecision',
+                    'leaveData': leave_data
+                }
+            else:
+                return {
+                    'response': '❌ Error processing auto-approval. Please try again.',
+                    'buttons': [{'text': 'Start Again', 'action': 'startAgain'}],
+                    'state': 'initial',
+                    'leaveData': {}
+                }
+        else:
+            # Full auto-approval (no HR review needed)
+            leave_id = insert_leave_record(leave_data, emp_email, status, auto_approval_type)
+            
+            if leave_id:
+                remarks = f"Auto-approved {approved_days} day(s) using {used_type}"
+                update_leave_status_db(leave_id, status, remarks, "SYSTEM", auto_approval_type)
+                
+                # Build response message
+                response_msg = f'''✅ Your leave has been auto-approved using {used_type}!
+
+Your updated leave balance:
+📅 Casual Leave: {new_balance['casual']} days
+🏥 Sick Leave: {new_balance['sick']} days
+⏰ Comp Off: {new_balance['compOff']} days
+
+📊 Monthly auto-approved days used for {leave_month}: {monthly_approved + approved_days}/2'''
+                
+                # Add LOP warning if any balance is negative
+                lop_details = []
+                if new_balance['casual'] < 0:
+                    lop_days = abs(new_balance['casual'])
+                    lop_amount = calculate_lop_amount(lop_days)
+                    lop_details.append(f"{lop_days} day(s) Casual Leave (₹{lop_amount} LOP)")
+                
+                if new_balance['sick'] < 0:
+                    lop_days = abs(new_balance['sick'])
+                    lop_amount = calculate_lop_amount(lop_days)
+                    lop_details.append(f"{lop_days} day(s) Sick Leave (₹{lop_amount} LOP)")
+                
+                if lop_details:
+                    response_msg += f"\n\n⚠️ Loss of Pay will be deducted: " + ", ".join(lop_details)
+                
+                if is_emergency:
+                    response_msg += f"\n🚨 Emergency requests used for {leave_month}: {monthly_emergency + 1}/1"
+                
+                return {
+                    'response': response_msg,
+                    'buttons': [{'text': 'Start Again', 'action': 'startAgain'}],
+                    'state': 'initial',
+                    'leaveData': {}
+                }
+            else:
+                return {
+                    'response': '❌ Error processing auto-approval. Please try again.',
+                    'buttons': [{'text': 'Start Again', 'action': 'startAgain'}],
+                    'state': 'initial',
+                    'leaveData': {}
+                }
+    
+    # If no auto-approval, suggest alternatives
+    return suggest_alternative_leaves_db(emp_email, leave_data, balance, is_emergency)
+
+def add_kpi_remark_db(emp_email, remark):
+    """Store KPI remarks in database or session"""
+    # For now, store in session. You can modify to store in database if needed.
+    if 'kpi_remarks' not in session:
+        session['kpi_remarks'] = []
+    session['kpi_remarks'].append({
+        'remark': remark,
+        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    })
+    session.modified = True
+
+def check_leave_eligibility():
+    """
+    Check if employee is eligible for automatic leave approval.
+    Returns: (is_eligible: bool, violations: list)
+    """
+    violations = []
+    
+    # Rule 1: Last month attendance > 90%
+    last_month_attendance = session.get('last_month_attendance', 95.0)
+    if last_month_attendance <= 90:
+        violations.append(f"❌ Last month attendance ({last_month_attendance}%) is not above 90%")
+    
+    # Rule 2: Last month work performance > 90%
+    last_month_performance = session.get('last_month_performance', 95.0)
+    if last_month_performance <= 90:
+        violations.append(f"❌ Last month work performance ({last_month_performance}%) is not above 90%")
+    
+    # Rule 3: Late coming minutes exceeded (120 minutes limit)
+    late_minutes_used = session.get('late_minutes_used', 0)
+    if late_minutes_used >= 120:
+        violations.append(f"❌ Late coming limit exceeded ({late_minutes_used} minutes used, limit: 120 minutes)")
+    
+    # Rule 4: Last 3 months average attendance > 85%
+    last_3_months_attendance = session.get('last_3_months_attendance', 90.0)
+    if last_3_months_attendance <= 85:
+        violations.append(f"❌ Last 3 months average attendance ({last_3_months_attendance}%) is not above 85%")
+    
+    # Rule 5: Pattern recognition - this is handled separately via semantic detection
+    
+    is_eligible = len(violations) == 0
+    return is_eligible, violations
+
+def calculate_lop_amount(lop_days, monthly_salary=30000):
+    """Calculate Loss of Pay amount"""
+    per_day_salary = monthly_salary / 30
+    lop_amount = lop_days * per_day_salary
+    return round(lop_amount, 2)
+
+def is_employee_sick(reason):
+    """
+    Decide if the employee is sick using the AI model.
+    Returns True if classified as 'sick', else False.
+    """
+    if not reason:
+        return False
+    label = classify_reason(reason)
+    return label == "sick"
+
+def handle_monthly_limit_exhausted_db(emp_email, leave_data, balance, is_emergency=False):
+    """Handle case when monthly auto-approval limit is exhausted"""
+    leave_type = leave_data.get('leaveType')
+    days = leave_data.get('duration', 0)
+    reason = leave_data.get('reason', '')
+    
+    if leave_data.get('fromDate'):
+        try:
+            from_date = datetime.strptime(leave_data.get('fromDate'), '%Y-%m-%d')
+            leave_month = from_date.strftime('%Y-%m')
+        except:
+            leave_month = datetime.now().strftime('%Y-%m')
+    else:
+        leave_month = datetime.now().strftime('%Y-%m')
+    
+    emergency_requests = get_monthly_emergency_requests(emp_email, leave_month)
+    
+    if is_emergency:
+        # Check if emergency quota available
+        if emergency_requests >= 1:
+            return {
+                'response': f'''❌ Emergency quota exhausted for {leave_month} (max 1 emergency request per month).
+
+Your application cannot be processed.''',
+                'buttons': [
+                    {'text': 'Cancel Leave', 'action': 'cancelLeave'}
+                ],
+                'state': 'waitingDecision',
+                'leaveData': leave_data
+            }
+        
+        recipient = "HR"
+        status = 0  # HR Review
+    else:
+        recipient = "Manager/HR"
+        status = 4  # Manager Review
+    
+    # Check what leaves would be used if approved
+    if leave_type == 'casual':
+        casual_available = balance['casual']
+        comp_off_available = balance['compOff']
+        
+        if casual_available >= days:
+            leave_source = f"{days} Casual Leave"
+        elif casual_available + comp_off_available >= days:
+            casual_used = min(casual_available, days)
+            comp_off_used = days - casual_used
+            leave_source = f"{casual_used} Casual Leave + {comp_off_used} Comp Off"
+        elif comp_off_available >= days:
+            leave_source = f"{days} Comp Off"
+        else:
+            available = casual_available + comp_off_available
+            leave_source = f"{available} days from available balance + {days - available} LOP"
+    
+    elif leave_type == 'sick':
+        sick_available = balance['sick']
+        comp_off_available = balance['compOff']
+        casual_available = balance['casual']
+        total_available = sick_available + comp_off_available + casual_available
+        
+        if total_available >= days:
+            parts = []
+            sick_used = min(sick_available, days)
+            if sick_used > 0:
+                parts.append(f"{sick_used} Sick Leave")
+            
+            remaining = days - sick_used
+            comp_off_used = min(comp_off_available, remaining)
+            if comp_off_used > 0:
+                parts.append(f"{comp_off_used} Comp Off")
+            
+            remaining -= comp_off_used
+            casual_used = min(casual_available, remaining)
+            if casual_used > 0:
+                parts.append(f"{casual_used} Casual Leave")
+            
+            leave_source = " + ".join(parts)
+        else:
+            leave_source = f"{total_available} days from available balance + {days - total_available} LOP"
+    
+    elif leave_type == 'compOff':
+        if balance['compOff'] >= days:
+            leave_source = f"{days} Comp Off"
+        else:
+            available = balance['compOff']
+            leave_source = f"{available} days from available balance + {days - available} LOP"
+    
+    # Store leave data for final submission
+    session['pending_approval'] = True
+    session['needs_review'] = True
+    session['review_type'] = 'EMERGENCY' if is_emergency else 'NORMAL'
+    
+    return {
+        'response': f'''📤 Your leave cannot be auto-approved due to monthly limit exhaustion (2/2 days used).
+
+Your application needs to be sent to {recipient} for approval.
+
+If approved, it will use: {leave_source}
+
+Your current balance (unchanged until approval):
+📅 Casual Leave: {balance['casual']} days
+🏥 Sick Leave: {balance['sick']} days
+⏰ Comp Off: {balance['compOff']} days
+
+Do you want to submit for {recipient} approval?''',
+        'buttons': [
+            {'text': f'Submit for {recipient} Approval', 'action': 'submitForApproval'},
+            {'text': 'Cancel Leave', 'action': 'cancelLeave'}
+        ],
+        'state': 'waitingDecision',
+        'leaveData': leave_data
+    }
+
+def suggest_alternative_leaves_db(emp_email, leave_data, balance, is_emergency=False):
+    """
+    Suggest alternative leave options when primary type has insufficient balance.
+    """
+    leave_type = leave_data.get('leaveType')
+    days = leave_data.get('duration', 0)
+    
+    # Check monthly auto-approval limit first
+    from_date_str = leave_data.get('fromDate')
+    if from_date_str:
+        try:
+            from_date = datetime.strptime(from_date_str, '%Y-%m-%d')
+            leave_month = from_date.strftime('%Y-%m')
+        except:
+            leave_month = datetime.now().strftime('%Y-%m')
+    else:
+        leave_month = datetime.now().strftime('%Y-%m')
+    
+    monthly_approved = get_monthly_auto_approved_days(emp_email, leave_month)
+    monthly_emergency = get_monthly_emergency_requests(emp_email, leave_month)
+    
+    # Check emergency quota
+    if is_emergency and monthly_emergency >= 1:
+        return {
+            'response': f'''❌ Emergency quota exhausted for {leave_month} (max 1 emergency request per month).
+
+Your application cannot be processed.''',
+            'buttons': [
+                {'text': 'Cancel Leave', 'action': 'cancelLeave'}
+            ],
+            'state': 'waitingDecision',
+            'leaveData': leave_data
+        }
+    
+    if monthly_approved >= 2 and not is_emergency:
+        return handle_monthly_limit_exhausted_db(emp_email, leave_data, balance, is_emergency)
+    
+    # Calculate total available balance for this leave type
+    if leave_type == 'casual':
+        total_available = balance['casual'] + balance['compOff']
+    elif leave_type == 'sick':
+        total_available = balance['sick'] + balance['compOff'] + balance['casual']
+    elif leave_type == 'compOff':
+        total_available = balance['compOff']
+    else:
+        total_available = 0
+    
+    # Handle NO balance at all
+    if total_available <= 0:
+        if is_emergency and monthly_approved == 0:
+            # No balance, no monthly quota used: 1 day emergency auto-approved
+            # Update balance with LOP
+            new_balance = balance.copy()
+            
+            if leave_type == 'casual':
+                new_balance['casual'] = -1
+            elif leave_type == 'sick':
+                new_balance['sick'] = -1
+            elif leave_type == 'compOff':
+                new_balance['casual'] = -1
+            
+            # Update database
+            update_employee_balance(emp_email, new_balance['casual'], 
+                                  new_balance['sick'], new_balance['compOff'])
+            
+            # Insert leave as auto-approved emergency
+            status = 1  # Approved
+            leave_id = insert_leave_record(leave_data, emp_email, status, 'EMERGENCY')
+            
+            if leave_id:
+                update_leave_status_db(leave_id, status, "Emergency override with LOP - Auto-approved", "SYSTEM", 'EMERGENCY')
+                
+                lop_amount = calculate_lop_amount(1)
+                return {
+                    'response': f'''✅ 1 day emergency leave auto-approved!
+
+Since you had no leave balance but haven't used any monthly quota,
+1 day has been auto-approved with Loss of Pay (₹{lop_amount}).
+
+Your updated leave balance:
+📅 Casual Leave: {new_balance['casual']} days
+🏥 Sick Leave: {new_balance['sick']} days
+⏰ Comp Off: {new_balance['compOff']} days
+
+🚨 Emergency request quota used: 1/1''',
+                    'buttons': [{'text': 'Start Again', 'action': 'startAgain'}],
+                    'state': 'initial',
+                    'leaveData': {}
+                }
+            else:
+                return {
+                    'response': '❌ Error processing emergency approval.',
+                    'buttons': [{'text': 'Start Again', 'action': 'startAgain'}],
+                    'state': 'initial',
+                    'leaveData': {}
+                }
+        else:
+            # No emergency or quota used: send for review
+            recipient = "HR" if is_emergency else "Manager/HR"
+            status = 0 if is_emergency else 4
+            
+            lop_amount = calculate_lop_amount(days)
+            
+            session['pending_approval'] = True
+            session['needs_review'] = True
+            session['review_type'] = 'EMERGENCY' if is_emergency else 'NORMAL'
+            
+            return {
+                'response': f'''⚠️ You don't have sufficient leave balance for any leave type.
+
+Current balance:
+📅 Casual Leave: {balance['casual']} days
+🏥 Sick Leave: {balance['sick']} days
+⏰ Comp Off: {balance['compOff']} days
+
+This will affect your KPI and ₹{lop_amount} LOP will be deducted from your salary.
+This request requires {recipient} approval (LOP is never auto-approved).
+
+Do you want to proceed to {recipient} review?''',
+                'buttons': [
+                    {'text': f'Submit for {recipient} Approval', 'action': 'submitForApproval'},
+                    {'text': 'Cancel Leave', 'action': 'cancelLeave'}
+                ],
+                'state': 'waitingDecision',
+                'leaveData': leave_data
+            }
+    
+    # There is some balance available
+    available_in_current = total_available
+    
+    if available_in_current > 0:
+        shortfall = max(0, days - available_in_current)
+        
+        # If sick leave, show all available options
+        if leave_type == 'sick':
             sick_available = balance['sick']
             comp_off_available = balance['compOff']
             casual_available = balance['casual']
             
-            sick_used = min(sick_available, approved_days)
-            remaining = approved_days - sick_used
-            
-            comp_off_used = min(comp_off_available, remaining)
-            remaining -= comp_off_used
-            
-            casual_used = min(casual_available, remaining)
-            
-            if sick_used > 0:
-                balance['sick'] -= sick_used
-            if comp_off_used > 0:
-                balance['compOff'] -= comp_off_used
-            if casual_used > 0:
-                balance['casual'] -= casual_used
-            
-            used_parts = []
-            if sick_used > 0:
-                used_parts.append(f"{sick_used} Sick Leave")
-            if comp_off_used > 0:
-                used_parts.append(f"{comp_off_used} Comp Off")
-            if casual_used > 0:
-                used_parts.append(f"{casual_used} Casual Leave")
-            
-            used_type = " + ".join(used_parts)
-            
-        elif leave_type == 'compOff':
-            balance['compOff'] -= approved_days
-            used_type = f'{approved_days} Comp Off'
-        
-        # FIXED: Update monthly counters for the leave month
-        update_monthly_counters(leave_month, approved_days, is_emergency)
-        
-        # Update the new counters
-        new_monthly_approved = session['monthly_auto_approved_by_month'].get(leave_month, 0)
-        new_monthly_emergency = session['monthly_emergency_by_month'].get(leave_month, 0)
-        
-        session['leave_balance'] = balance
-        track_applied_leave(leave_data, status='approved')
-        session.modified = True
-        
-        # Build response message
-        if hr_days > 0:
-            if is_emergency:
-                recipient = "HR"
-            else:
-                recipient = "Manager/HR"
-            
-            response_msg = f'''✅ {approved_days} day(s) have been auto-approved using {used_type}!
-            
-The remaining {hr_days} day(s) will require {recipient} approval.
+            if sick_available >= days:
+                # Auto-approve sick leave if eligible
+                # Check monthly limit first
+                if monthly_approved >= 2:
+                    return handle_monthly_limit_exhausted_db(emp_email, leave_data, balance, is_emergency)
+                
+                # Auto-approve the sick leave
+                new_balance = balance.copy()
+                new_balance['sick'] -= days
+                
+                # Update database
+                update_employee_balance(emp_email, new_balance['casual'], 
+                                      new_balance['sick'], new_balance['compOff'])
+                
+                # Insert leave as auto-approved
+                status = 1  # Approved
+                auto_approval_type = 'EMERGENCY' if is_emergency else 'NORMAL'
+                leave_id = insert_leave_record(leave_data, emp_email, status, auto_approval_type)
+                
+                if leave_id:
+                    remarks = f"Auto-approved {days} Sick Leave"
+                    update_leave_status_db(leave_id, status, remarks, "SYSTEM", auto_approval_type)
+                    
+                    return {
+                        'response': f'''✅ Your leave has been auto-approved using {days} Sick Leave!
 
 Your updated leave balance:
-📅 Casual Leave: {balance['casual']} days
-🏥 Sick Leave: {balance['sick']} days
-⏰ Comp Off: {balance['compOff']} days
+📅 Casual Leave: {new_balance['casual']} days
+🏥 Sick Leave: {new_balance['sick']} days
+⏰ Comp Off: {new_balance['compOff']} days
 
-📊 Monthly auto-approved days used for {leave_month}: {new_monthly_approved}/2'''
-        else:
-            response_msg = f'''✅ Your leave has been auto-approved using {used_type}!
+📊 Monthly auto-approved days used for {leave_month}: {monthly_approved + days}/2''',
+                        'buttons': [{'text': 'Start Again', 'action': 'startAgain'}],
+                        'state': 'initial',
+                        'leaveData': {}
+                    }
+                else:
+                    return {
+                        'response': '❌ Error processing auto-approval. Please try again.',
+                        'buttons': [{'text': 'Start Again', 'action': 'startAgain'}],
+                        'state': 'initial',
+                        'leaveData': {}
+                    }
+            elif sick_available > 0 and (comp_off_available + casual_available) >= (days - sick_available):
+                # Auto-approve combination if eligible
+                if monthly_approved >= 2:
+                    return handle_monthly_limit_exhausted_db(emp_email, leave_data, balance, is_emergency)
+                
+                # Process with combination - this will be handled by the main process_leave_application function
+                return process_leave_application(emp_email, leave_data)
+            elif (comp_off_available + casual_available) >= days:
+                # Process without sick balance - this will be handled by the main process_leave_application function
+                return process_leave_application(emp_email, leave_data)
+        
+        elif leave_type == 'casual':
+            casual_available = balance['casual']
+            comp_off_available = balance['compOff']
+            
+            if casual_available >= days:
+                # Auto-approve casual leave if eligible
+                if monthly_approved >= 2:
+                    return handle_monthly_limit_exhausted_db(emp_email, leave_data, balance, is_emergency)
+                
+                # Auto-approve the casual leave
+                new_balance = balance.copy()
+                new_balance['casual'] -= days
+                
+                # Update database
+                update_employee_balance(emp_email, new_balance['casual'], 
+                                      new_balance['sick'], new_balance['compOff'])
+                
+                # Insert leave as auto-approved
+                status = 1  # Approved
+                auto_approval_type = 'EMERGENCY' if is_emergency else 'NORMAL'
+                leave_id = insert_leave_record(leave_data, emp_email, status, auto_approval_type)
+                
+                if leave_id:
+                    remarks = f"Auto-approved {days} Casual Leave"
+                    update_leave_status_db(leave_id, status, remarks, "SYSTEM", auto_approval_type)
+                    
+                    return {
+                        'response': f'''✅ Your leave has been auto-approved using {days} Casual Leave!
 
 Your updated leave balance:
-📅 Casual Leave: {balance['casual']} days
-🏥 Sick Leave: {balance['sick']} days
-⏰ Comp Off: {balance['compOff']} days
+📅 Casual Leave: {new_balance['casual']} days
+🏥 Sick Leave: {new_balance['sick']} days
+⏰ Comp Off: {new_balance['compOff']} days
 
-📊 Monthly auto-approved days used for {leave_month}: {new_monthly_approved}/2'''
-        
-        if is_emergency:
-            response_msg += f"\n🚨 Emergency requests used for {leave_month}: {new_monthly_emergency}/1"
-        
-        return {
-            'response': response_msg,
-            'buttons': [{'text': 'Start Again', 'action': 'startAgain'}],
-            'state': 'initial'
-        }
+📊 Monthly auto-approved days used for {leave_month}: {monthly_approved + days}/2''',
+                        'buttons': [{'text': 'Start Again', 'action': 'startAgain'}],
+                        'state': 'initial',
+                        'leaveData': {}
+                    }
+                else:
+                    return {
+                        'response': '❌ Error processing auto-approval. Please try again.',
+                        'buttons': [{'text': 'Start Again', 'action': 'startAgain'}],
+                        'state': 'initial',
+                        'leaveData': {}
+                    }
+            elif casual_available > 0 and comp_off_available >= shortfall:
+                # Process with combination - this will be handled by the main process_leave_application function
+                return process_leave_application(emp_email, leave_data)
+            elif comp_off_available >= days:
+                # Process comp off only - this will be handled by the main process_leave_application function
+                return process_leave_application(emp_email, leave_data)
     
-    # If we reach here, suggest alternatives
-    return suggest_alternative_leaves(leave_data, balance, is_emergency)
+    # Check total available balance
+    total_available = available_in_current
+    if total_available > 0:
+        return check_partial_lop_options_db(emp_email, leave_data, balance, is_emergency)
+    else:
+        # NO balance at all - handled above
+        pass
+
+def check_partial_lop_options_db(emp_email, leave_data, balance, is_emergency=False):
+    """Check if partial LOP is possible with available balances"""
+    days = leave_data.get('duration', 0)
+    leave_type = leave_data.get('leaveType')
+    
+    # Calculate total available days from all applicable leave types
+    if leave_type == 'casual':
+        total_available = balance['casual'] + balance['compOff']
+    elif leave_type == 'sick':
+        total_available = balance['sick'] + balance['compOff'] + balance['casual']
+    elif leave_type == 'compOff':
+        total_available = balance['compOff']
+    else:
+        total_available = 0
+    
+    if total_available > 0:
+        lop_days = max(0, days - total_available)
+        
+        # Build available types list
+        available_types = []
+        if leave_type == 'casual':
+            if balance['casual'] > 0:
+                available_types.append(('Casual Leave', balance['casual']))
+            if balance['compOff'] > 0:
+                available_types.append(('Comp Off', balance['compOff']))
+        elif leave_type == 'sick':
+            if balance['sick'] > 0:
+                available_types.append(('Sick Leave', balance['sick']))
+            if balance['compOff'] > 0:
+                available_types.append(('Comp Off', balance['compOff']))
+            if balance['casual'] > 0:
+                available_types.append(('Casual Leave', balance['casual']))
+        elif leave_type == 'compOff' and balance['compOff'] > 0:
+            available_types.append(('Comp Off', balance['compOff']))
+        
+        balance_text = "\n".join([f"- {leave_type}: {avail_days} day(s)" for leave_type, avail_days in available_types])
+        
+        if lop_days > 0:
+            lop_amount = calculate_lop_amount(lop_days)
+            response_text = f'''⚠️ You have some leave balance available, but partial LOP is required:
+
+{balance_text}
+
+This will use all available balance + {lop_days} LOP day(s) (₹{lop_amount})
+Requires HR approval (LOP is never auto-approved).
+
+Would you like to proceed?'''
+            
+            session['pending_approval'] = True
+            session['needs_review'] = True
+            session['review_type'] = 'EMERGENCY' if is_emergency else 'NORMAL'
+            
+            return {
+                'response': response_text,
+                'buttons': [
+                    {'text': 'Submit for HR Approval', 'action': 'submitForApproval'},
+                    {'text': 'Cancel Leave', 'action': 'cancelLeave'}
+                ],
+                'state': 'waitingDecision'
+            }
+        else:
+            response_text = f'''You have sufficient leave balance available:
+
+{balance_text}
+
+This will use all available balance to cover {days} day(s).
+
+Would you like to proceed?'''
+            
+            return {
+                'response': response_text,
+                'buttons': [
+                    {'text': 'Submit for Approval', 'action': 'submitForApproval'},
+                    {'text': 'Cancel Leave', 'action': 'cancelLeave'}
+                ],
+                'state': 'waitingDecision'
+            }
+    
+    # No balances available
+    return proceed_to_lop_db(emp_email, leave_data, balance, is_emergency)
+
+def proceed_to_lop_db(emp_email, leave_data, balance, is_emergency=False):
+    """Handle full LOP case - NO balance at all"""
+    days = leave_data.get('duration', 0)
+    lop_amount = calculate_lop_amount(days)
+    
+    recipient = "HR" if is_emergency else "Manager/HR"
+    status = 0 if is_emergency else 4
+    
+    session['pending_approval'] = True
+    session['needs_review'] = True
+    session['review_type'] = 'EMERGENCY' if is_emergency else 'NORMAL'
+    
+    return {
+        'response': f'''⚠️ You don't have sufficient leave balance for any leave type.
+
+Current balance:
+📅 Casual Leave: {balance['casual']} days
+🏥 Sick Leave: {balance['sick']} days
+⏰ Comp Off: {balance['compOff']} days
+
+This will affect your KPI and ₹{lop_amount} LOP will be deducted from your salary.
+This request requires {recipient} approval (LOP is never auto-approved).
+
+Do you want to proceed to {recipient} review?''',
+        'buttons': [
+            {'text': f'Submit for {recipient} Approval', 'action': 'submitForApproval'},
+            {'text': 'Cancel Leave', 'action': 'cancelLeave'}
+        ],
+        'state': 'waitingDecision'
+    }
+
+# ===================== FLASK APP =====================
 
 app = Flask(__name__)
 app.secret_key = secrets.token_hex(16)
 
-# HTML Template (unchanged, same as your original)
+# Initialize session data
+def init_session():
+    # Get balance from database for the employee
+    balance = get_employee_balance(EMPLOYEE_EMAIL)
+    session['leave_balance'] = balance
+    
+    # Performance tracking variables (hardcoded as per requirements)
+    if 'last_month_attendance' not in session:
+        session['last_month_attendance'] = 95.0
+    if 'last_month_performance' not in session:
+        session['last_month_performance'] = 95.0
+    if 'late_minutes_used' not in session:
+        session['late_minutes_used'] = 0
+    if 'last_3_months_attendance' not in session:
+        session['last_3_months_attendance'] = 90.0
+    if 'leave_pattern_violation' not in session:
+        session['leave_pattern_violation'] = False
+    if 'kpi_remarks' not in session:
+        session['kpi_remarks'] = []
+    
+    if 'employee_salary' not in session:
+        session['employee_salary'] = 30000
+    
+    session.modified = True
+
+# HTML Template (same as original)
 HTML_TEMPLATE = '''
 <!DOCTYPE html>
 <html lang="en">
@@ -1213,798 +2566,7 @@ HTML_TEMPLATE = '''
 </html>
 '''
 
-# Initialize session data
-def init_session():
-    if 'leave_balance' not in session:
-        session['leave_balance'] = {
-            'casual': 2,
-            'sick': 5,
-            'compOff': 1
-        }
-    if 'employee_salary' not in session:
-        session['employee_salary'] = 30000
-    if 'applied_leaves' not in session:
-        session['applied_leaves'] = []
-    
-    # Performance tracking variables
-    if 'last_month_attendance' not in session:
-        session['last_month_attendance'] = 95.0
-    if 'last_month_performance' not in session:
-        session['last_month_performance'] = 95.0
-    if 'late_minutes_used' not in session:
-        session['late_minutes_used'] = 0
-    if 'last_3_months_attendance' not in session:
-        session['last_3_months_attendance'] = 90.0
-    if 'leave_pattern_violation' not in session:
-        session['leave_pattern_violation'] = False
-    if 'kpi_remarks' not in session:
-        session['kpi_remarks'] = []
-    
-    # FIXED: Store monthly counters per month (dictionary keyed by 'YYYY-MM')
-    if 'monthly_auto_approved_by_month' not in session:
-        session['monthly_auto_approved_by_month'] = {}
-    if 'monthly_emergency_by_month' not in session:
-        session['monthly_emergency_by_month'] = {}
-    
-    session.modified = True
-
-def get_monthly_counters_for_leave(leave_data):
-    """
-    Get the monthly counters for the month of the leave application.
-    This allows users to apply for next month's leave even if current month quota is exhausted.
-    
-    Returns: (monthly_approved: int, monthly_emergency: int, month_key: str)
-    """
-    from_date_str = leave_data.get('fromDate')
-    
-    if not from_date_str:
-        # Fallback to current month if no FROM date
-        current_month = datetime.now().strftime('%Y-%m')
-        monthly_approved = session.get('monthly_auto_approved_by_month', {}).get(current_month, 0)
-        monthly_emergency = session.get('monthly_emergency_by_month', {}).get(current_month, 0)
-        return (monthly_approved, monthly_emergency, current_month)
-    
-    try:
-        from_date = datetime.strptime(from_date_str, '%Y-%m-%d')
-        # Use the month of the FROM date for quota tracking
-        leave_month = from_date.strftime('%Y-%m')
-        
-        monthly_approved = session.get('monthly_auto_approved_by_month', {}).get(leave_month, 0)
-        monthly_emergency = session.get('monthly_emergency_by_month', {}).get(leave_month, 0)
-        
-        return (monthly_approved, monthly_emergency, leave_month)
-    except:
-        # Fallback to current month on error
-        current_month = datetime.now().strftime('%Y-%m')
-        monthly_approved = session.get('monthly_auto_approved_by_month', {}).get(current_month, 0)
-        monthly_emergency = session.get('monthly_emergency_by_month', {}).get(current_month, 0)
-        return (monthly_approved, monthly_emergency, current_month)
-
-def update_monthly_counters(leave_month, approved_days=0, is_emergency=False):
-    """
-    Update monthly counters for the specific month.
-    
-    Args:
-        leave_month: Month key in format 'YYYY-MM'
-        approved_days: Number of days auto-approved
-        is_emergency: Whether this is an emergency request
-    """
-    if 'monthly_auto_approved_by_month' not in session:
-        session['monthly_auto_approved_by_month'] = {}
-    if 'monthly_emergency_by_month' not in session:
-        session['monthly_emergency_by_month'] = {}
-    
-    # Update counters for the specific month
-    current_approved = session['monthly_auto_approved_by_month'].get(leave_month, 0)
-    session['monthly_auto_approved_by_month'][leave_month] = current_approved + approved_days
-    
-    if is_emergency:
-        current_emergency = session['monthly_emergency_by_month'].get(leave_month, 0)
-        session['monthly_emergency_by_month'][leave_month] = current_emergency + 1
-    
-    session.modified = True
-    
-def check_leave_eligibility():
-    """
-    Check if employee is eligible for automatic leave approval.
-    Returns: (is_eligible: bool, violations: list)
-    """
-    violations = []
-    
-    # Rule 1: Last month attendance > 90%
-    if session.get('last_month_attendance', 100) <= 90:
-        violations.append(f"❌ Last month attendance ({session.get('last_month_attendance')}%) is not above 90%")
-    
-    # Rule 2: Last month work performance > 90%
-    if session.get('last_month_performance', 100) <= 90:
-        violations.append(f"❌ Last month work performance ({session.get('last_month_performance')}%) is not above 90%")
-    
-    # Rule 3: Late coming minutes exceeded (120 minutes limit)
-    if session.get('late_minutes_used', 0) >= 120:
-        violations.append(f"❌ Late coming limit exceeded ({session.get('late_minutes_used')} minutes used, limit: 120 minutes)")
-    
-    # Rule 4: Last 3 months average attendance > 85%
-    if session.get('last_3_months_attendance', 100) <= 85:
-        violations.append(f"❌ Last 3 months average attendance ({session.get('last_3_months_attendance')}%) is not above 85%")
-    
-    # Rule 5: Pattern recognition - same reason in 3 consecutive months
-    if session.get('leave_pattern_violation', False):
-        violations.append("❌ Pattern violation: You have applied for leave with similar reasons in the last 3 consecutive months")
-    
-    is_eligible = len(violations) == 0
-    return is_eligible, violations
-
-def is_valid_date_format(date_string):
-    """Check if date is in YYYY-MM-DD format"""
-    try:
-        datetime.strptime(date_string, '%Y-%m-%d')
-        return True
-    except ValueError:
-        return False
-
-def is_employee_sick(reason):
-    """
-    Decide if the employee is sick using the AI model.
-    Returns True if classified as 'sick', else False.
-    """
-    if not reason:
-        return False
-    label = classify_reason(reason)
-    return label == "sick"
-
-def has_date_overlap(new_from_date, new_to_date, applied_leaves):
-    """Check if new dates overlap with already applied leaves"""
-    try:
-        new_from = datetime.strptime(new_from_date, '%Y-%m-%d')
-        new_to = datetime.strptime(new_to_date, '%Y-%m-%d')
-        
-        for applied_leave in applied_leaves:
-            if not applied_leave.get('fromDate') or not applied_leave.get('toDate'):
-                continue
-            
-            applied_from = datetime.strptime(applied_leave['fromDate'], '%Y-%m-%d')
-            applied_to = datetime.strptime(applied_leave['toDate'], '%Y-%m-%d')
-            
-            if (new_from <= applied_to) and (new_to >= applied_from):
-                return True
-        return False
-    except (ValueError, TypeError):
-        return True
-
-def calculate_lop_amount(lop_days):
-    monthly_salary = session.get('employee_salary', 30000)
-    per_day_salary = monthly_salary / 30
-    lop_amount = lop_days * per_day_salary
-    return round(lop_amount, 2)
-
-def track_applied_leave(leave_data, status='applied'):
-    """Track applied leave dates in session."""
-    if 'applied_leaves' not in session:
-        session['applied_leaves'] = []
-
-    category = categorize_reason_for_pattern(leave_data.get('reason', '') or '')
-
-    session['applied_leaves'].append({
-        'fromDate': leave_data.get('fromDate'),
-        'toDate': leave_data.get('toDate'),
-        'leaveType': leave_data.get('leaveType'),
-        'reason': leave_data.get('reason'),
-        'category': category,
-        'status': status,
-        'timestamp': datetime.now().strftime('%Y-%m-%d')
-    })
-    session.modified = True
-
-# ----------------- HELPER FUNCTIONS FOR LEAVE PROCESSING -----------------
-
-def handle_monthly_limit_exhausted(leave_data, balance, is_emergency=False):
-    """Handle case when monthly auto-approval limit is exhausted"""
-    leave_type = leave_data.get('leaveType')
-    days = leave_data.get('duration', 0)
-    reason = leave_data.get('reason', '')
-    
-    if is_emergency:
-        recipient = "HR"
-        status = 'pending_hr'
-    else:
-        recipient = "Manager/HR"
-        status = 'pending_manager'
-    
-    # Check what leaves would be used if approved
-    if leave_type == 'casual':
-        casual_available = balance['casual']
-        comp_off_available = balance['compOff']
-        
-        if casual_available >= days:
-            leave_source = f"{days} Casual Leave"
-        elif casual_available + comp_off_available >= days:
-            casual_used = min(casual_available, days)
-            comp_off_used = days - casual_used
-            leave_source = f"{casual_used} Casual Leave + {comp_off_used} Comp Off"
-        elif comp_off_available >= days:
-            leave_source = f"{days} Comp Off"
-        else:
-            available = casual_available + comp_off_available
-            leave_source = f"{available} days from available balance + {days - available} LOP"
-    
-    elif leave_type == 'sick':
-        sick_available = balance['sick']
-        comp_off_available = balance['compOff']
-        casual_available = balance['casual']
-        total_available = sick_available + comp_off_available + casual_available
-        
-        if total_available >= days:
-            parts = []
-            sick_used = min(sick_available, days)
-            if sick_used > 0:
-                parts.append(f"{sick_used} Sick Leave")
-            
-            remaining = days - sick_used
-            comp_off_used = min(comp_off_available, remaining)
-            if comp_off_used > 0:
-                parts.append(f"{comp_off_used} Comp Off")
-            
-            remaining -= comp_off_used
-            casual_used = min(casual_available, remaining)
-            if casual_used > 0:
-                parts.append(f"{casual_used} Casual Leave")
-            
-            leave_source = " + ".join(parts)
-        else:
-            leave_source = f"{total_available} days from available balance + {days - total_available} LOP"
-    
-    elif leave_type == 'compOff':
-        if balance['compOff'] >= days:
-            leave_source = f"{days} Comp Off"
-        else:
-            available = balance['compOff']
-            leave_source = f"{available} days from available balance + {days - available} LOP"
-    
-    track_applied_leave(leave_data, status=status)
-    
-    return {
-        'response': f'''📤 Your leave cannot be auto-approved due to monthly limit exhaustion (2/2 days used).
-
-Your application has been sent to {recipient} for approval.
-
-If approved, it will use: {leave_source}
-
-Your current balance (unchanged until approval):
-📅 Casual Leave: {balance['casual']} days
-🏥 Sick Leave: {balance['sick']} days
-⏰ Comp Off: {balance['compOff']} days
-
-📊 Monthly auto-approved days used: {session.get('monthly_auto_approved_days', 0)}/2''',
-        'buttons': [
-            {'text': 'Submit for Approval', 'action': 'submitForApproval'},
-            {'text': 'Cancel Leave', 'action': 'cancelLeave'}
-        ],
-        'state': 'waitingDecision',
-        'leaveData': leave_data
-    }
-
-def suggest_alternative_leaves(leave_data, balance, is_emergency=False):
-    """
-    Suggest alternative leave options when primary type has insufficient balance.
-    """
-    leave_type = leave_data.get('leaveType')
-    days = leave_data.get('duration', 0)
-    
-    # Check monthly auto-approval limit first
-    monthly_approved = session.get('monthly_auto_approved_days', 0)
-    if monthly_approved >= 2 and not is_emergency:
-        return handle_monthly_limit_exhausted(leave_data, balance, is_emergency)
-    
-    # Calculate total available balance for this leave type
-    if leave_type == 'casual':
-        total_available = balance['casual'] + balance['compOff']
-    elif leave_type == 'sick':
-        total_available = balance['sick'] + balance['compOff'] + balance['casual']
-    elif leave_type == 'compOff':
-        total_available = balance['compOff']
-    else:
-        total_available = 0
-    
-    available_in_current = total_available
-    
-    if available_in_current > 0:
-        shortfall = max(0, days - available_in_current)
-        
-        # If sick leave, show all available options
-        if leave_type == 'sick':
-            sick_available = balance['sick']
-            comp_off_available = balance['compOff']
-            casual_available = balance['casual']
-            
-            if sick_available >= days:
-                return {
-                    'response': f'''You have {sick_available} day(s) of Sick Leave available.
-This will use: {days} Sick Leave''',
-                    'buttons': [
-                        {'text': f'Yes, Use {days} Sick Leave', 'action': 'useSickOnly'},
-                        {'text': 'No, Proceed with Manager/HR Review', 'action': 'submitForApproval'},
-                        {'text': 'Cancel Leave', 'action': 'cancelLeave'}
-                    ],
-                    'state': 'waitingDecision'
-                }
-            elif sick_available > 0 and (comp_off_available + casual_available) >= (days - sick_available):
-                return {
-                    'response': f'''You have limited Sick Leave balance ({sick_available} days).
-Would you like to use other available balances?
-
-Available balances (in priority order):
-- Sick Leave: {sick_available} days
-- Comp Off: {comp_off_available} days
-- Casual Leave: {casual_available} days
-
-This will use: {sick_available} Sick Leave + {days - sick_available} from Comp Off/Casual Leave''',
-                    'buttons': [
-                        {'text': f'Yes, Use All Available Balances', 'action': 'useCombinationForSick'},
-                        {'text': 'No, Proceed with Manager/HR Review', 'action': 'submitForApproval'},
-                        {'text': 'Cancel Leave', 'action': 'cancelLeave'}
-                    ],
-                    'state': 'waitingDecision'
-                }
-            elif (comp_off_available + casual_available) >= days:
-                return {
-                    'response': f'''You don't have Sick Leave balance, but you can use other balances:
-
-Available balances (in priority order):
-- Comp Off: {comp_off_available} days
-- Casual Leave: {casual_available} days
-
-This will use: Comp Off + Casual Leave (as needed for sick leave)''',
-                    'buttons': [
-                        {'text': f'Yes, Use Comp Off/Casual Leave', 'action': 'useCasualCompOffForSick'},
-                        {'text': 'No, Proceed with Manager/HR Review', 'action': 'submitForApproval'},
-                        {'text': 'Cancel Leave', 'action': 'cancelLeave'}
-                    ],
-                    'state': 'waitingDecision'
-                }
-        
-        elif leave_type == 'casual':
-            casual_available = balance['casual']
-            comp_off_available = balance['compOff']
-            
-            if casual_available >= days:
-                return {
-                    'response': f'''You have {casual_available} day(s) of Casual Leave available.
-This will use: {days} Casual Leave''',
-                    'buttons': [
-                        {'text': f'Yes, Use {days} Casual Leave', 'action': 'useCasualOnly'},
-                        {'text': 'No, Proceed with Manager/HR Review', 'action': 'submitForApproval'},
-                        {'text': 'Cancel Leave', 'action': 'cancelLeave'}
-                    ],
-                    'state': 'waitingDecision'
-                }
-            elif casual_available > 0 and comp_off_available >= shortfall:
-                return {
-                    'response': f'''You have {casual_available} day(s) of Casual Leave available.
-Would you like to use Comp Off for the remaining {shortfall} day(s)?
-
-This will use: {casual_available} Casual Leave + {shortfall} Comp Off''',
-                    'buttons': [
-                        {'text': f'Yes, Use {casual_available} Casual + {shortfall} Comp Off', 'action': 'usePartialCasualWithCompOff'},
-                        {'text': 'No, Proceed with Manager/HR Review', 'action': 'submitForApproval'},
-                        {'text': 'Cancel Leave', 'action': 'cancelLeave'}
-                    ],
-                    'state': 'waitingDecision'
-                }
-            elif comp_off_available >= days:
-                return {
-                    'response': f'''You don't have Casual Leave, but you can use {comp_off_available} Comp Off.
-
-This will use: {days} Comp Off''',
-                    'buttons': [
-                        {'text': f'Yes, Use {days} Comp Off', 'action': 'useCompOffOnly'},
-                        {'text': 'No, Proceed with Manager/HR Review', 'action': 'submitForApproval'},
-                        {'text': 'Cancel Leave', 'action': 'cancelLeave'}
-                    ],
-                    'state': 'waitingDecision'
-                }
-    
-    # Check total available balance
-    total_available = available_in_current
-        
-    if total_available > 0:
-        return check_partial_lop_options(leave_data, balance, is_emergency)
-    else:
-        # NO balance at all
-        if is_emergency and days == 1:
-            return {
-                'response': '''🚨 EMERGENCY DETECTED: You have no leave balance, but emergency override allows 1 day auto-approval.
-
-Your 1 day emergency leave has been auto-approved (LOP will apply).''',
-                'buttons': [{'text': 'Start Again', 'action': 'startAgain'}],
-                'state': 'initial'
-            }
-        else:
-            return {
-                'response': f'''⚠️ You don't have sufficient leave balance for any leave type.
-
-Casual Leave: {balance['casual']} days
-Sick Leave: {balance['sick']} days
-Comp Off: {balance['compOff']} days
-
-This will require HR approval and result in Loss of Pay (LOP).''',
-                'buttons': [
-                    {'text': 'Submit for HR Approval', 'action': 'submitForApproval'},
-                    {'text': 'Cancel Leave', 'action': 'cancelLeave'}
-                ],
-                'state': 'waitingDecision'
-            }
-
-def check_partial_lop_options(leave_data, balance, is_emergency=False):
-    """Check if partial LOP is possible with available balances"""
-    days = leave_data.get('duration', 0)
-    leave_type = leave_data.get('leaveType')
-    
-    # Calculate total available days from all applicable leave types
-    if leave_type == 'casual':
-        total_available = balance['casual'] + balance['compOff']
-    elif leave_type == 'sick':
-        total_available = balance['sick'] + balance['compOff'] + balance['casual']
-    elif leave_type == 'compOff':
-        total_available = balance['compOff']
-    else:
-        total_available = 0
-    
-    if total_available > 0:
-        lop_days = max(0, days - total_available)
-        
-        # Build available types list
-        available_types = []
-        if leave_type == 'casual':
-            if balance['casual'] > 0:
-                available_types.append(('Casual Leave', balance['casual']))
-            if balance['compOff'] > 0:
-                available_types.append(('Comp Off', balance['compOff']))
-        elif leave_type == 'sick':
-            if balance['sick'] > 0:
-                available_types.append(('Sick Leave', balance['sick']))
-            if balance['compOff'] > 0:
-                available_types.append(('Comp Off', balance['compOff']))
-            if balance['casual'] > 0:
-                available_types.append(('Casual Leave', balance['casual']))
-        elif leave_type == 'compOff' and balance['compOff'] > 0:
-            available_types.append(('Comp Off', balance['compOff']))
-        
-        balance_text = "\n".join([f"- {leave_type}: {avail_days} day(s)" for leave_type, avail_days in available_types])
-        
-        if lop_days > 0:
-            lop_amount = calculate_lop_amount(lop_days)
-            response_text = f'''⚠️ You have some leave balance available, but partial LOP is required:
-
-{balance_text}
-
-This will use all available balance + {lop_days} LOP day(s) (₹{lop_amount})
-Requires HR approval (LOP is never auto-approved).
-
-Would you like to proceed?'''
-            
-            return {
-                'response': response_text,
-                'buttons': [
-                    {'text': 'Yes, Submit for HR Approval', 'action': 'submitForApproval'},
-                    {'text': 'No, Cancel', 'action': 'cancelLeave'}
-                ],
-                'state': 'waitingDecision'
-            }
-        else:
-            response_text = f'''You have sufficient leave balance available:
-
-{balance_text}
-
-This will use all available balance to cover {days} day(s).
-
-Would you like to proceed?'''
-            
-            return {
-                'response': response_text,
-                'buttons': [
-                    {'text': 'Yes, Submit for Approval', 'action': 'submitForApproval'},
-                    {'text': 'No, Cancel', 'action': 'cancelLeave'}
-                ],
-                'state': 'waitingDecision'
-            }
-    
-    # No balances available, proceed to full LOP
-    return proceed_to_lop(leave_data, balance, is_emergency)
-
-def proceed_to_lop(leave_data, balance, is_emergency=False):
-    """Handle full LOP case - NO balance at all"""
-    days = leave_data.get('duration', 0)
-    lop_amount = calculate_lop_amount(days)
-    
-    if is_emergency and days == 1:
-        # Emergency override: 1 day auto-approved even with no balance
-        session['monthly_emergency_requests'] += 1
-        session['monthly_auto_approved_days'] += 1
-        track_applied_leave(leave_data, status='approved')
-        session.modified = True
-        
-        return {
-            'response': f'''🚨 EMERGENCY OVERRIDE: Your 1 day emergency leave has been auto-approved!
-
-📊 Monthly auto-approved days used: {session['monthly_auto_approved_days']}/2
-🚨 Emergency requests used: {session['monthly_emergency_requests']}/1
-
-⚠️ Note: This will result in Loss of Pay (₹{lop_amount}) as you have no leave balance.''',
-            'buttons': [{'text': 'Start Again', 'action': 'startAgain'}],
-            'state': 'initial'
-        }
-    
-    if is_emergency:
-        recipient = "HR"
-    else:
-        recipient = "Manager/HR"
-    
-    return {
-        'response': f'''⚠️ You don't have sufficient leave balance for any leave type.
-
-Current balance:
-📅 Casual Leave: {balance['casual']} days
-🏥 Sick Leave: {balance['sick']} days
-⏰ Comp Off: {balance['compOff']} days
-
-This will affect your KPI and ₹{lop_amount} LOP will be deducted from your salary.
-This request requires {recipient} approval (LOP is never auto-approved).
-
-Do you want to proceed to {recipient} review?''',
-        'buttons': [
-            {'text': f'Yes, Submit for {recipient} Approval', 'action': 'submitForApproval'},
-            {'text': 'No, Cancel', 'action': 'cancelLeave'}
-        ],
-        'state': 'waitingDecision'
-    }
-
-def process_partial_combination(leave_data, balance, primary_type, secondary_type):
-    """Process leave using combination of two leave types"""
-    days = leave_data.get('duration', 0)
-    is_sick_reason = is_employee_sick(leave_data.get('reason', ''))
-    
-    # Calculate how many days can be used from each type
-    primary_available = balance[primary_type]
-    primary_used = min(primary_available, days)
-    remaining = days - primary_used
-    
-    secondary_used = min(balance[secondary_type], remaining)
-    remaining_after_secondary = remaining - secondary_used
-    
-    # Check eligibility for auto-approval
-    is_eligible, violations = check_leave_eligibility()
-    if not is_eligible:
-        violation_text = "\n".join(violations)
-        
-        # Still deduct the balance but require manager approval
-        balance[primary_type] -= primary_used
-        balance[secondary_type] -= secondary_used
-        session['leave_balance'] = balance
-        track_applied_leave(leave_data, status='pending_manager')
-        
-        # Build response for Manager/HR approval
-        primary_display = 'Comp Off' if primary_type == 'compOff' else primary_type.title() + ' Leave'
-        secondary_display = 'Comp Off' if secondary_type == 'compOff' else secondary_type.title() + ' Leave'
-        
-        breakdown = f"- {primary_used} day(s) {primary_display}\n- {secondary_used} day(s) {secondary_display}"
-        
-        if remaining_after_secondary > 0:
-            lop_amount = calculate_lop_amount(remaining_after_secondary)
-            breakdown += f"\n- LOP: {remaining_after_secondary} day(s) (₹{lop_amount})"
-        
-        response_msg = f'''⚠️ Your leave cannot be auto-approved due to violations:
-
-{violation_text}
-
-Your leave has been submitted for manager approval.
-
-Leave breakdown:
-{breakdown}
-
-Your updated leave balance:
-📅 Casual Leave: {balance['casual']} days
-🏥 Sick Leave: {balance['sick']} days
-⏰ Comp Off: {balance['compOff']} days'''
-        
-        return {
-            'response': response_msg,
-            'buttons': [{'text': 'Start Again', 'action': 'startAgain'}],
-            'state': 'initial'
-        }
-    
-    # Check monthly auto-approval limits
-    monthly_approved = session.get('monthly_auto_approved_days', 0)
-    remaining_monthly = 2 - monthly_approved
-    
-    # RULE 1-3: Monthly auto-approval limit
-    if remaining_monthly <= 0:
-        # Monthly limit exhausted, need Manager/HR approval
-        balance[primary_type] -= primary_used
-        balance[secondary_type] -= secondary_used
-        session['leave_balance'] = balance
-        
-        track_applied_leave(leave_data, status='pending_manager')
-        
-        # Build response for Manager/HR approval
-        primary_display = 'Comp Off' if primary_type == 'compOff' else primary_type.title() + ' Leave'
-        secondary_display = 'Comp Off' if secondary_type == 'compOff' else secondary_type.title() + ' Leave'
-        
-        breakdown = f"- {primary_used} day(s) {primary_display}\n- {secondary_used} day(s) {secondary_display}"
-        
-        if remaining_after_secondary > 0:
-            lop_amount = calculate_lop_amount(remaining_after_secondary)
-            breakdown += f"\n- LOP: {remaining_after_secondary} day(s) (₹{lop_amount})"
-        
-        response_msg = f'''📤 Your leave application has been submitted and is waiting for Manager/HR approval.
-
-Reason: Monthly auto-approval limit exhausted (2/2 days used)
-
-Leave breakdown:
-{breakdown}
-
-Your updated leave balance:
-📅 Casual Leave: {balance['casual']} days
-🏥 Sick Leave: {balance['sick']} days
-⏰ Comp Off: {balance['compOff']} days'''
-        
-        return {
-            'response': response_msg,
-            'buttons': [{'text': 'Start Again', 'action': 'startAgain'}],
-            'state': 'initial'
-        }
-    
-    # Calculate how many days can be auto-approved
-    primary_available_for_auto = min(primary_used, remaining_monthly)
-    remaining_monthly -= primary_available_for_auto
-    secondary_available_for_auto = min(secondary_used, remaining_monthly)
-    
-    total_auto_approved = primary_available_for_auto + secondary_available_for_auto
-    
-    if remaining_after_secondary > 0:
-        # Has LOP days - cannot auto-approve
-        balance[primary_type] -= primary_used
-        balance[secondary_type] -= secondary_used
-        session['leave_balance'] = balance
-        
-        track_applied_leave(leave_data, status='pending_manager')
-        
-        lop_amount = calculate_lop_amount(remaining_after_secondary)
-        
-        primary_display = 'Comp Off' if primary_type == 'compOff' else primary_type.title() + ' Leave'
-        secondary_display = 'Comp Off' if secondary_type == 'compOff' else secondary_type.title() + ' Leave'
-        
-        breakdown = f"- {primary_used} day(s) {primary_display}\n- {secondary_used} day(s) {secondary_display}"
-        breakdown += f"\n- LOP: {remaining_after_secondary} day(s) (₹{lop_amount})"
-        
-        response_msg = f'''⚠️ Your leave cannot be fully auto-approved due to LOP requirements.
-
-The {primary_used + secondary_used} day(s) using available balance have been approved.
-The remaining {remaining_after_secondary} LOP day(s) will require Manager/HR approval.
-
-Leave breakdown:
-{breakdown}
-
-Your updated leave balance:
-📅 Casual Leave: {balance['casual']} days
-🏥 Sick Leave: {balance['sick']} days
-⏰ Comp Off: {balance['compOff']} days'''
-        
-        return {
-            'response': response_msg,
-            'buttons': [{'text': 'Start Again', 'action': 'startAgain'}],
-            'state': 'initial'
-        }
-    
-    # All days can be covered by available balance
-    # Update monthly counter
-    session['monthly_auto_approved_days'] += total_auto_approved
-    
-    # Deduct leaves
-    balance[primary_type] -= primary_used
-    balance[secondary_type] -= secondary_used
-    session['leave_balance'] = balance
-    track_applied_leave(leave_data, status='approved')
-    
-    # Build response
-    primary_display = 'Comp Off' if primary_type == 'compOff' else primary_type.title() + ' Leave'
-    secondary_display = 'Comp Off' if secondary_type == 'compOff' else secondary_type.title() + ' Leave'
-    
-    breakdown = f"- {primary_used} day(s) {primary_display}\n- {secondary_used} day(s) {secondary_display}"
-    
-    response_msg = f'''✅ Your leave has been auto-approved!
-
-Leave breakdown:
-{breakdown}
-
-Your updated leave balance:
-📅 Casual Leave: {balance['casual']} days
-🏥 Sick Leave: {balance['sick']} days
-⏰ Comp Off: {balance['compOff']} days
-
-📊 Monthly auto-approved days used: {session['monthly_auto_approved_days']}/2'''
-    
-    return {
-        'response': response_msg,
-        'buttons': [{'text': 'Start Again', 'action': 'startAgain'}],
-        'state': 'initial'
-    }
-
-def process_sick_leave_with_combination(leave_data, balance):
-    """Process sick leave using combination of sick + other balances"""
-    days = leave_data.get('duration', 0)
-    
-    # Calculate how many days from each balance (priority: sick -> comp off -> casual)
-    sick_available = balance['sick']
-    comp_off_available = balance['compOff']
-    casual_available = balance['casual']
-    
-    sick_used = min(sick_available, days)
-    remaining = days - sick_used
-    
-    comp_off_used = min(comp_off_available, remaining)
-    remaining -= comp_off_used
-    
-    casual_used = min(casual_available, remaining)
-    remaining_after_all = remaining - casual_used
-    
-    # Check monthly auto-approval limits
-    monthly_approved = session.get('monthly_auto_approved_days', 0)
-    remaining_monthly = 2 - monthly_approved
-    
-    if remaining_monthly <= 0:
-        # Monthly limit exhausted
-        return handle_monthly_limit_exhausted(leave_data, balance, False)
-    
-    # Calculate how many days can be auto-approved
-    total_auto_approved = min(days - remaining_after_all, remaining_monthly)
-    
-    if remaining_after_all > 0:
-        # Has LOP days - cannot auto-approve
-        return check_partial_lop_options(leave_data, balance, False)
-    
-    # All days can be covered by available balance
-    # Update monthly counter
-    session['monthly_auto_approved_days'] += total_auto_approved
-    
-    # Deduct leaves
-    balance['sick'] -= sick_used
-    balance['compOff'] -= comp_off_used
-    balance['casual'] -= casual_used
-    session['leave_balance'] = balance
-    track_applied_leave(leave_data, status='approved')
-    session.modified = True
-    
-    # Build response
-    used_parts = []
-    if sick_used > 0:
-        used_parts.append(f"{sick_used} Sick Leave")
-    if comp_off_used > 0:
-        used_parts.append(f"{comp_off_used} Comp Off")
-    if casual_used > 0:
-        used_parts.append(f"{casual_used} Casual Leave")
-    
-    breakdown = "\n".join([f"- {part}" for part in used_parts])
-    
-    response_msg = f'''✅ Your leave has been auto-approved!
-
-Leave breakdown:
-{breakdown}
-
-Your updated leave balance:
-📅 Casual Leave: {balance['casual']} days
-🏥 Sick Leave: {balance['sick']} days
-⏰ Comp Off: {balance['compOff']} days
-
-📊 Monthly auto-approved days used: {session['monthly_auto_approved_days']}/2'''
-    
-    return {
-        'response': response_msg,
-        'buttons': [{'text': 'Start Again', 'action': 'startAgain'}],
-        'state': 'initial'
-    }
-
-# ----------------- FLASK ROUTES -----------------
-
+# Flask Routes
 @app.route('/')
 def index():
     return render_template_string(HTML_TEMPLATE)
@@ -2012,8 +2574,15 @@ def index():
 @app.route('/init')
 def init():
     init_session()
+    balance = session['leave_balance']
+    
     return jsonify({
-        'response': 'Welcome! 👋 How can I help you today?',
+        'response': f'''Welcome! 👋 How can I help you today?
+
+Your current leave balance:
+📅 Casual Leave: {balance['casual']} days
+🏥 Sick Leave: {balance['sick']} days
+⏰ Comp Off: {balance['compOff']} days''',
         'buttons': [
             {'text': 'Apply for a Leave', 'action': 'applyLeave'},
             {'text': 'Check Leave Balance', 'action': 'checkBalance'},
@@ -2023,6 +2592,9 @@ def init():
         'state': 'initial',
         'needsInput': False
     })
+# @app.route("/health")
+# def health():
+#     return "API is running"
 
 @app.route('/handle_action', methods=['POST'])
 def handle_action():
@@ -2030,7 +2602,10 @@ def handle_action():
     data = request.json
     action = data.get('action')
     leave_data = data.get('leaveData', {})
-    balance = session['leave_balance']
+    
+    # Get balance from database
+    balance = get_employee_balance(EMPLOYEE_EMAIL)
+    session['leave_balance'] = balance
     
     response = {'needsInput': False, 'buttons': None, 'state': 'initial', 'leaveData': leave_data}
     
@@ -2107,26 +2682,24 @@ Please enter your reason:'''
             for remark in kpi_remarks[-3:]:
                 remarks_text += f"\n• {remark['remark']} ({remark['timestamp']})"
         
-        # FIXED: Show current and next month's counters
+        # Get monthly counters from database
         current_month = datetime.now().strftime('%Y-%m')
+        current_month_approved = get_monthly_auto_approved_days(EMPLOYEE_EMAIL, current_month)
+        current_month_emergency = get_monthly_emergency_requests(EMPLOYEE_EMAIL, current_month)
+        
         next_month = (datetime.now().replace(day=1) + timedelta(days=32)).replace(day=1).strftime('%Y-%m')
-        
-        current_month_approved = session.get('monthly_auto_approved_by_month', {}).get(current_month, 0)
-        current_month_emergency = session.get('monthly_emergency_by_month', {}).get(current_month, 0)
-        
-        next_month_approved = session.get('monthly_auto_approved_by_month', {}).get(next_month, 0)
-        next_month_emergency = session.get('monthly_emergency_by_month', {}).get(next_month, 0)
+        next_month_approved = get_monthly_auto_approved_days(EMPLOYEE_EMAIL, next_month)
+        next_month_emergency = get_monthly_emergency_requests(EMPLOYEE_EMAIL, next_month)
         
         current_month_name = datetime.now().strftime('%B %Y')
         next_month_name = (datetime.now().replace(day=1) + timedelta(days=32)).replace(day=1).strftime('%B %Y')
         
         metrics = f'''📊 Your Performance Metrics:
 
-📅 Last Month Attendance: {session.get('last_month_attendance', 0)}%
-💼 Last Month Performance: {session.get('last_month_performance', 0)}%
+📅 Last Month Attendance: {session.get('last_month_attendance', 95.0)}%
+💼 Last Month Performance: {session.get('last_month_performance', 95.0)}%
 ⏰ Late Minutes Used: {session.get('late_minutes_used', 0)}/120 minutes
-📈 Last 3 Months Avg Attendance: {session.get('last_3_months_attendance', 0)}%
-🔍 Pattern Violation: {'Yes' if session.get('leave_pattern_violation', False) else 'No'}
+📈 Last 3 Months Avg Attendance: {session.get('last_3_months_attendance', 90.0)}%
 
 📆 Monthly Leave Tracking:
 {current_month_name}:
@@ -2175,189 +2748,110 @@ Please enter your reason:'''
         
     elif action == 'switchToCasual':
         leave_data['leaveType'] = 'casual'
-        result = process_leave_application(leave_data, balance)
+        result = process_leave_application(EMPLOYEE_EMAIL, leave_data)
         response.update(result)
         response['leaveData'] = leave_data
         
     elif action == 'switchToSick':
         leave_data['leaveType'] = 'sick'
-        result = process_leave_application(leave_data, balance)
+        result = process_leave_application(EMPLOYEE_EMAIL, leave_data)
         response.update(result)
         response['leaveData'] = leave_data
         
     elif action == 'switchToCompoff':
         leave_data['leaveType'] = 'compOff'
-        result = process_leave_application(leave_data, balance)
+        result = process_leave_application(EMPLOYEE_EMAIL, leave_data)
         response.update(result)
         response['leaveData'] = leave_data
         
     elif action == 'useSickOnly':
-        # New action: Use sick leave only
-        leave_type = leave_data.get('leaveType')
-        days = leave_data.get('duration', 0)
-        
-        if leave_type == 'sick' and balance['sick'] >= days:
-            # Check monthly auto-approval limit
-            monthly_approved = session.get('monthly_auto_approved_days', 0)
-            if monthly_approved >= 2:
-                return handle_monthly_limit_exhausted(leave_data, balance, False)
-            
-            # Auto-approve if eligible
-            balance['sick'] -= days
-            session['monthly_auto_approved_days'] += days
-            session['leave_balance'] = balance
-            track_applied_leave(leave_data, status='approved')
-            session.modified = True
-            
-            response['response'] = f'''✅ Your leave has been auto-approved using {days} Sick Leave!
-
-Your updated leave balance:
-📅 Casual Leave: {balance['casual']} days
-🏥 Sick Leave: {balance['sick']} days
-⏰ Comp Off: {balance['compOff']} days
-
-📊 Monthly auto-approved days used: {session['monthly_auto_approved_days']}/2'''
-            response['buttons'] = [{'text': 'Start Again', 'action': 'startAgain'}]
-            response['state'] = 'initial'
-        else:
-            response['response'] = 'Unable to process request. Please try again.'
-            response['buttons'] = [
-                {'text': 'Apply for a Leave', 'action': 'applyLeave'},
-                {'text': 'Check Leave Balance', 'action': 'checkBalance'}
-            ]
-            response['state'] = 'initial'
+        # Use sick leave only - use the main processing function
+        leave_data['leaveType'] = 'sick'
+        result = process_leave_application(EMPLOYEE_EMAIL, leave_data)
+        response.update(result)
+        response['leaveData'] = leave_data
         
     elif action == 'useCasualOnly':
-        # New action: Use casual leave only
-        leave_type = leave_data.get('leaveType')
-        days = leave_data.get('duration', 0)
+        # Use casual leave only - use the main processing function
+        leave_data['leaveType'] = 'casual'
+        result = process_leave_application(EMPLOYEE_EMAIL, leave_data)
+        response.update(result)
+        response['leaveData'] = leave_data
         
-        if leave_type == 'casual' and balance['casual'] >= days:
-            # Check monthly auto-approval limit
-            monthly_approved = session.get('monthly_auto_approved_days', 0)
-            if monthly_approved >= 2:
-                return handle_monthly_limit_exhausted(leave_data, balance, False)
-            
-            # Auto-approve if eligible
-            balance['casual'] -= days
-            session['monthly_auto_approved_days'] += days
-            session['leave_balance'] = balance
-            track_applied_leave(leave_data, status='approved')
-            session.modified = True
-            
-            response['response'] = f'''✅ Your leave has been auto-approved using {days} Casual Leave!
-
-Your updated leave balance:
-📅 Casual Leave: {balance['casual']} days
-🏥 Sick Leave: {balance['sick']} days
-⏰ Comp Off: {balance['compOff']} days
-
-📊 Monthly auto-approved days used: {session['monthly_auto_approved_days']}/2'''
-            response['buttons'] = [{'text': 'Start Again', 'action': 'startAgain'}]
-            response['state'] = 'initial'
-        else:
-            response['response'] = 'Unable to process request. Please try again.'
-            response['buttons'] = [
-                {'text': 'Apply for a Leave', 'action': 'applyLeave'},
-                {'text': 'Check Leave Balance', 'action': 'checkBalance'}
-            ]
-            response['state'] = 'initial'
-    
     elif action == 'useCompOffOnly':
-        # New action: Use comp off only
-        leave_type = leave_data.get('leaveType')
-        days = leave_data.get('duration', 0)
-        
-        if leave_type in ['casual', 'compOff'] and balance['compOff'] >= days:
-            # Check monthly auto-approval limit
-            monthly_approved = session.get('monthly_auto_approved_days', 0)
-            if monthly_approved >= 2:
-                return handle_monthly_limit_exhausted(leave_data, balance, False)
-            
-            # Auto-approve if eligible
-            balance['compOff'] -= days
-            session['monthly_auto_approved_days'] += days
-            session['leave_balance'] = balance
-            track_applied_leave(leave_data, status='approved')
-            session.modified = True
-            
-            response['response'] = f'''✅ Your leave has been auto-approved using {days} Comp Off!
-
-Your updated leave balance:
-📅 Casual Leave: {balance['casual']} days
-🏥 Sick Leave: {balance['sick']} days
-⏰ Comp Off: {balance['compOff']} days
-
-📊 Monthly auto-approved days used: {session['monthly_auto_approved_days']}/2'''
-            response['buttons'] = [{'text': 'Start Again', 'action': 'startAgain'}]
-            response['state'] = 'initial'
-        else:
-            response['response'] = 'Unable to process request. Please try again.'
-            response['buttons'] = [
-                {'text': 'Apply for a Leave', 'action': 'applyLeave'},
-                {'text': 'Check Leave Balance', 'action': 'checkBalance'}
-            ]
-            response['state'] = 'initial'
+        # Use comp off only - use the main processing function
+        leave_data['leaveType'] = 'compOff'
+        result = process_leave_application(EMPLOYEE_EMAIL, leave_data)
+        response.update(result)
+        response['leaveData'] = leave_data
         
     elif action == 'usePartialCasualWithCompOff':
-        result = process_partial_combination(leave_data, balance, primary_type='casual', secondary_type='compOff')
+        # Process partial combination - use the main processing function
+        result = process_leave_application(EMPLOYEE_EMAIL, leave_data)
         response.update(result)
     
     elif action == 'useCombinationForSick':
-        result = process_sick_leave_with_combination(leave_data, balance)
+        # Process sick with combination - use the main processing function
+        result = process_leave_application(EMPLOYEE_EMAIL, leave_data)
         response.update(result)
     
     elif action == 'useCasualCompOffForSick':
-        # For sick leave without sick balance, use comp off and casual (priority: comp off first)
-        leave_type = leave_data.get('leaveType')
-        days = leave_data.get('duration', 0)
+        # Process sick without sick balance - use the main processing function
+        result = process_leave_application(EMPLOYEE_EMAIL, leave_data)
+        response.update(result)
         
-        # Use comp off first, then casual
-        comp_off_available = balance['compOff']
-        casual_available = balance['casual']
+    elif action == 'submitRemainingForApproval':
+        # Submit remaining days for HR/Manager approval
+        remaining_data = session.get('remaining_leave_data', {})
+        remaining_days = session.get('remaining_days', 0)
+        already_approved = session.get('already_approved_days', 0)
         
-        comp_off_used = min(comp_off_available, days)
-        remaining = days - comp_off_used
-        casual_used = min(casual_available, remaining)
+        if not remaining_data or remaining_days == 0:
+            response['response'] = '❌ No remaining leave to submit. Starting over...'
+            response['buttons'] = [{'text': 'Start Again', 'action': 'startAgain'}]
+            response['state'] = 'initial'
+            return jsonify(response)
         
-        # Check monthly auto-approval limit
-        monthly_approved = session.get('monthly_auto_approved_days', 0)
-        remaining_monthly = 2 - monthly_approved
+        # Check if emergency
+        reason = remaining_data.get('reason', '')
+        from_date_str = remaining_data.get('fromDate')
+        is_emergency = remaining_data.get('isEmergency', False)
+        if not is_emergency and from_date_str:
+            is_emergency = is_emergency_leave_ai(reason, from_date_str)
         
-        if remaining_monthly <= 0:
-            return handle_monthly_limit_exhausted(leave_data, balance, False)
+        if is_emergency:
+            recipient = "HR"
+            status = 0  # HR Review
+        else:
+            recipient = "Manager/HR"
+            status = 4  # Manager Review
         
-        # Update monthly counter
-        total_used = comp_off_used + casual_used
-        session['monthly_auto_approved_days'] += total_used
+        # Create leave data for remaining days
+        remaining_leave_data = remaining_data.copy()
+        remaining_leave_data['duration'] = remaining_days
         
-        # Deduct balances
-        balance['compOff'] -= comp_off_used
-        balance['casual'] -= casual_used
-        session['leave_balance'] = balance
-        track_applied_leave(leave_data, status='approved')
-        session.modified = True
+        # Insert leave application for remaining days
+        leave_id = insert_leave_record(remaining_leave_data, EMPLOYEE_EMAIL, status)
         
-        # Build response
-        used_parts = []
-        if comp_off_used > 0:
-            used_parts.append(f"{comp_off_used} Comp Off")
-        if casual_used > 0:
-            used_parts.append(f"{casual_used} Casual Leave")
-        
-        used_type = " + ".join(used_parts)
-        
-        response['response'] = f'''✅ Your leave has been auto-approved using {used_type}!
+        if leave_id:
+            response['response'] = f'''📤 The remaining {remaining_days} day(s) have been submitted and are waiting for {recipient} approval.
 
-Your updated leave balance:
-📅 Casual Leave: {balance['casual']} days
-🏥 Sick Leave: {balance['sick']} days
-⏰ Comp Off: {balance['compOff']} days
+✅ {already_approved} day(s) were auto-approved.
+⏳ {remaining_days} day(s) are pending {recipient} approval.
 
-📊 Monthly auto-approved days used: {session['monthly_auto_approved_days']}/2'''
+Your leave balance has been updated for the auto-approved portion.'''
+        else:
+            response['response'] = '❌ Error submitting remaining leave. Please try again.'
+        
+        # Clear session data
+        session.pop('remaining_leave_data', None)
+        session.pop('remaining_days', None)
+        session.pop('already_approved_days', None)
+        
         response['buttons'] = [{'text': 'Start Again', 'action': 'startAgain'}]
         response['state'] = 'initial'
-        
+        response['leaveData'] = {}
+                
     elif action == 'submitForApproval':
         # Submit for HR/Manager approval
         leave_type = leave_data.get('leaveType')
@@ -2365,74 +2859,73 @@ Your updated leave balance:
         reason = leave_data.get('reason', '')
         from_date_str = leave_data.get('fromDate')
         
-        # Check if emergency (considering date now)
-        is_emergency = False
-        if from_date_str:
+        # Check if emergency (from session or re-evaluate)
+        is_emergency = leave_data.get('isEmergency', False)
+        if not is_emergency and from_date_str:
             is_emergency = is_emergency_leave_ai(reason, from_date_str)
         
         if is_emergency:
             recipient = "HR"
-            status = 'pending_hr'
+            status = 0  # HR Review
         else:
             recipient = "Manager/HR"
-            status = 'pending_manager'
+            status = 4  # Manager Review
         
-        # Check what leaves would be used if approved - FIXED: Use appropriate balances
-        if leave_type == 'casual':
-            # Use casual leave first, then comp off
-            casual_available = balance['casual']
-            comp_off_available = balance['compOff']
+        # Insert leave application (ONLY ONCE - at final submission)
+        leave_id = insert_leave_record(leave_data, EMPLOYEE_EMAIL, status)
+        
+        if leave_id:
+            # Check what leaves would be used if approved
+            if leave_type == 'casual':
+                casual_available = balance['casual']
+                comp_off_available = balance['compOff']
+                
+                if casual_available >= days:
+                    leave_source = f"{days} Casual Leave"
+                elif casual_available + comp_off_available >= days:
+                    casual_used = min(casual_available, days)
+                    comp_off_used = days - casual_used
+                    leave_source = f"{casual_used} Casual Leave + {comp_off_used} Comp Off"
+                elif comp_off_available >= days:
+                    leave_source = f"{days} Comp Off"
+                else:
+                    available = casual_available + comp_off_available
+                    leave_source = f"{available} days from available balance + {days - available} LOP"
             
-            if casual_available >= days:
-                leave_source = f"{days} Casual Leave"
-            elif casual_available + comp_off_available >= days:
-                casual_used = min(casual_available, days)
-                comp_off_used = days - casual_used
-                leave_source = f"{casual_used} Casual Leave + {comp_off_used} Comp Off"
-            elif comp_off_available >= days:
-                leave_source = f"{days} Comp Off"
-            else:
-                available = casual_available + comp_off_available
-                leave_source = f"{available} days from available balance + {days - available} LOP"
-        
-        elif leave_type == 'sick':
-            # FIXED: Sick leave can use ALL THREE balances (priority: sick -> comp off -> casual)
-            sick_available = balance['sick']
-            comp_off_available = balance['compOff']
-            casual_available = balance['casual']
-            total_available = sick_available + comp_off_available + casual_available
+            elif leave_type == 'sick':
+                sick_available = balance['sick']
+                comp_off_available = balance['compOff']
+                casual_available = balance['casual']
+                total_available = sick_available + comp_off_available + casual_available
+                
+                if total_available >= days:
+                    parts = []
+                    sick_used = min(sick_available, days)
+                    if sick_used > 0:
+                        parts.append(f"{sick_used} Sick Leave")
+                    
+                    remaining = days - sick_used
+                    comp_off_used = min(comp_off_available, remaining)
+                    if comp_off_used > 0:
+                        parts.append(f"{comp_off_used} Comp Off")
+                    
+                    remaining -= comp_off_used
+                    casual_used = min(casual_available, remaining)
+                    if casual_used > 0:
+                        parts.append(f"{casual_used} Casual Leave")
+                    
+                    leave_source = " + ".join(parts)
+                else:
+                    leave_source = f"{total_available} days from available balance + {days - total_available} LOP"
             
-            if total_available >= days:
-                # Build breakdown (priority order)
-                parts = []
-                sick_used = min(sick_available, days)
-                if sick_used > 0:
-                    parts.append(f"{sick_used} Sick Leave")
-                
-                remaining = days - sick_used
-                comp_off_used = min(comp_off_available, remaining)
-                if comp_off_used > 0:
-                    parts.append(f"{comp_off_used} Comp Off")
-                
-                remaining -= comp_off_used
-                casual_used = min(casual_available, remaining)
-                if casual_used > 0:
-                    parts.append(f"{casual_used} Casual Leave")
-                
-                leave_source = " + ".join(parts)
-            else:
-                leave_source = f"{total_available} days from available balance + {days - total_available} LOP"
-        
-        elif leave_type == 'compOff':
-            if balance['compOff'] >= days:
-                leave_source = f"{days} Comp Off"
-            else:
-                available = balance['compOff']
-                leave_source = f"{available} days from available balance + {days - available} LOP"
-        
-        track_applied_leave(leave_data, status=status)
-        
-        response['response'] = f'''📤 Your leave application has been submitted and is waiting for {recipient} approval.
+            elif leave_type == 'compOff':
+                if balance['compOff'] >= days:
+                    leave_source = f"{days} Comp Off"
+                else:
+                    available = balance['compOff']
+                    leave_source = f"{available} days from available balance + {days - available} LOP"
+            
+            response['response'] = f'''📤 Your leave application has been submitted and is waiting for {recipient} approval.
 
 Application Details:
 - Leave Type: {'Comp Off' if leave_type == 'compOff' else leave_type.title() + ' Leave'}
@@ -2442,9 +2935,12 @@ Application Details:
 If approved, it will use: {leave_source}
 
 Your leave balance remains unchanged pending approval.'''
+        else:
+            response['response'] = '❌ Error submitting leave application. Please try again.'
         
         response['buttons'] = [{'text': 'Start Again', 'action': 'startAgain'}]
         response['state'] = 'initial'
+        response['leaveData'] = {}
         
     elif action == 'cancelLeave':
         response['response'] = 'Leave application cancelled. Starting over...'
@@ -2462,7 +2958,26 @@ Your leave balance remains unchanged pending approval.'''
         ]
         
     elif action == 'startAgain':
-        response['response'] = 'Welcome back! 👋 How can I help you today?'
+        # Refresh balance from database
+        balance = get_employee_balance(EMPLOYEE_EMAIL)
+        session['leave_balance'] = balance
+        
+        # Clear any pending session data
+        session.pop('calculated_balance', None)
+        session.pop('pending_approval', None)
+        session.pop('needs_review', None)
+        session.pop('review_type', None)
+        session.pop('emergency_no_balance', None)
+        session.pop('remaining_leave_data', None)
+        session.pop('remaining_days', None)
+        session.pop('already_approved_days', None)
+        
+        response['response'] = f'''Welcome back! 👋 How can I help you today?
+
+Your current leave balance:
+📅 Casual Leave: {balance['casual']} days
+🏥 Sick Leave: {balance['sick']} days
+⏰ Comp Off: {balance['compOff']} days'''
         response['buttons'] = [
             {'text': 'Apply for a Leave', 'action': 'applyLeave'},
             {'text': 'Check Leave Balance', 'action': 'checkBalance'},
@@ -2479,8 +2994,6 @@ def process_input():
     message = data.get('message')
     state = data.get('state')
     leave_data = data.get('leaveData', {})
-    balance = session['leave_balance']
-    applied_leaves = session['applied_leaves']
     
     response = {'needsInput': False, 'buttons': None, 'state': 'initial', 'leaveData': leave_data}
     
@@ -2547,7 +3060,7 @@ Please try again with a proper reason:'''
         response['needsInput'] = True
         response['state'] = 'enterFromDate'
         response['leaveData'] = leave_data
-        
+            
     elif state == 'enterFromDate':
         if not is_valid_date_format(message):
             response['response'] = '❌ Invalid date format! Please enter date in YYYY-MM-DD format (e.g., 2024-12-25):'
@@ -2557,12 +3070,22 @@ Please try again with a proper reason:'''
         
         leave_type = leave_data.get('leaveType', '')
         reason = leave_data.get('reason', '')
-        is_sick_reason = is_employee_sick(reason)
         
-        # CRITICAL FIX: Check emergency ONLY after we have the FROM date
-        is_emergency = is_emergency_leave_ai(reason, message)
+        # Check emergency BEFORE date validation
+        is_emergency = False
+        if leave_type != 'sick':  # Sick leaves cannot be emergency
+            is_emergency = is_emergency_leave_ai(reason, message, leave_type)
+        leave_data['isEmergency'] = is_emergency
         
-        if leave_type == 'sick' or is_sick_reason:
+        print(f"\n{'='*60}")
+        print(f"📝 EMERGENCY DETECTION SUMMARY:")
+        print(f"   Reason: {reason}")
+        print(f"   From Date: {message}")
+        print(f"   Leave Type: {leave_type}")
+        print(f"   Is Emergency: {is_emergency}")
+        print(f"{'='*60}\n")
+        
+        if leave_type == 'sick':
             if not is_valid_sick_leave_from_date(message):
                 response['response'] = '❌ For sick leaves, FROM date can only be past dates, today, or tomorrow. Please enter a valid FROM date:'
                 response['needsInput'] = True
@@ -2574,23 +3097,36 @@ Please try again with a proper reason:'''
                 if is_emergency:
                     response['response'] = "❌ For EMERGENCY casual leave, FROM date MUST be TODAY. Please enter today's date:"
                 else:
-                    response['response'] = '❌ For casual leave, FROM date must be TOMORROW or later (one day prior rule). Please enter a valid FROM date:'
+                    response['response'] = '❌ For normal casual leave, FROM date must be TOMORROW or later (one day prior rule). You CANNOT apply casual leave for TODAY. Please enter a valid FROM date:'
                 response['needsInput'] = True
                 response['state'] = 'enterFromDate'
                 return jsonify(response)
         
         elif leave_type == 'compOff':
-            if not is_valid_casual_comp_off_from_date(message, is_emergency):
+            if not validate_compoff_leave_date(message, is_emergency, reason):
                 if is_emergency:
                     response['response'] = "❌ For EMERGENCY comp off, FROM date MUST be TODAY. Please enter today's date:"
                 else:
-                    response['response'] = '❌ For Comp Off leaves, FROM date must be today or a future date. Please enter a valid FROM date:'
+                    # Check reason classification
+                    classification = classify_reason(reason) if reason else 'casual'
+                    if classification == 'sick':
+                        response['response'] = '❌ For Comp Off with sick reason, FROM date can be past, today, or tomorrow. Please enter a valid FROM date:'
+                    else:
+                        response['response'] = '❌ For Comp Off with casual reason, FROM date must be TOMORROW or later (one day prior rule). You CANNOT apply comp off for TODAY. Please enter a valid FROM date:'
                 response['needsInput'] = True
                 response['state'] = 'enterFromDate'
                 return jsonify(response)
+    
+        # Check for overlapping leaves
+        overlapping_leaves = get_overlapping_leaves(EMPLOYEE_EMAIL, message, message)
+        if overlapping_leaves:
+            response['response'] = f'❌ You already have a leave application for {message}. Please choose a different date:'
+            response['needsInput'] = True
+            response['state'] = 'enterFromDate'
+            return jsonify(response)
         
         leave_data['fromDate'] = message
-        
+                
         # Add emergency note if applicable
         if is_emergency:
             emergency_note = " 🚨 EMERGENCY DETECTED"
@@ -2601,7 +3137,7 @@ Please try again with a proper reason:'''
         response['needsInput'] = True
         response['state'] = 'enterToDate'
         response['leaveData'] = leave_data
-        
+                
     elif state == 'enterToDate':
         if not is_valid_date_format(message):
             response['response'] = '❌ Invalid date format! Please enter date in YYYY-MM-DD format (e.g., 2024-12-25):'
@@ -2626,7 +3162,9 @@ Please try again with a proper reason:'''
                 response['state'] = 'enterToDate'
                 return jsonify(response)
         
-        if has_date_overlap(leave_data.get('fromDate'), message, applied_leaves):
+        # Check for overlapping leaves
+        overlapping_leaves = get_overlapping_leaves(EMPLOYEE_EMAIL, from_date, message)
+        if overlapping_leaves:
             response['response'] = '❌ These dates overlap with your already applied leaves! Please choose different dates:'
             response['needsInput'] = True
             response['state'] = 'enterToDate'
@@ -2674,11 +3212,18 @@ Please try again with a proper reason:'''
 
         response['response'] = response_text
         
-        result = process_leave_application(leave_data, balance)
+        # Process the leave application (does NOT insert into database yet)
+        result = process_leave_application(EMPLOYEE_EMAIL, leave_data)
         response.update(result)
         response['leaveData'] = leave_data
         
     return jsonify(response)
 
-if __name__ == '__main__':
-    app.run(debug=True, port=8083)
+if __name__ == "__main__":
+    app.run(
+        host="0.0.0.0",
+        port=8080,
+        debug=False,
+        use_reloader=False
+    )
+
