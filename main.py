@@ -32,15 +32,15 @@ def get_db_connection():
 # ===================== DATABASE FUNCTIONS =====================
 
 def get_employee_balance(emp_email):
-    """Get leave balance from database for specific employee"""
+    """Get leave balance from database for specific employee including LOP"""
     try:
         conn = get_db_connection()
         if not conn:
             print("⚠️ Could not connect to database for leave balance")
-            return {'casual': 0, 'sick': 0, 'compOff': 0}
+            return {'casual': 0, 'sick': 0, 'compOff': 0, 'lop': 0}
         
         cursor = conn.cursor(dictionary=True)
-        query = "SELECT cl, sl, co FROM leavebalance WHERE empemail = %s"
+        query = "SELECT cl, sl, co, lop FROM leavebalance WHERE empemail = %s"
         cursor.execute(query, (emp_email,))
         result = cursor.fetchone()
         
@@ -61,23 +61,28 @@ def get_employee_balance(emp_email):
                 co = float(result['co']) if result['co'] and str(result['co']).strip() != '' else 0.0
             except:
                 co = 0.0
+            try:
+                lop = float(result['lop']) if 'lop' in result and result['lop'] and str(result['lop']).strip() != '' else 0.0
+            except:
+                lop = 0.0
                 
             return {
                 'casual': cl,
                 'sick': sl,
-                'compOff': co
+                'compOff': co,
+                'lop': lop
             }
         else:
             # If employee not found, create default entry
             print(f"⚠️ Employee {emp_email} not found in leavebalance table")
-            return {'casual': 0, 'sick': 0, 'compOff': 0}
+            return {'casual': 0, 'sick': 0, 'compOff': 0, 'lop': 0}
             
     except Error as e:
         print(f"❌ Database error fetching leave balance: {e}")
-        return {'casual': 0, 'sick': 0, 'compOff': 0}
+        return {'casual': 0, 'sick': 0, 'compOff': 0, 'lop': 0}
 
-def update_employee_balance(emp_email, casual_days, sick_days, comp_off_days):
-    """Update leave balance in database - handle negative values"""
+def update_employee_balance(emp_email, casual_days, sick_days, comp_off_days, lop_days=0):
+    """Update leave balance in database - handle LOP separately, never negative balances"""
     try:
         conn = get_db_connection()
         if not conn:
@@ -92,33 +97,35 @@ def update_employee_balance(emp_email, casual_days, sick_days, comp_off_days):
         count = cursor.fetchone()[0]
         
         if count == 0:
-            # Insert new record
+            # Insert new record with LOP
             insert_query = """
-            INSERT INTO leavebalance (empemail, cl, sl, co, lastupdate) 
-            VALUES (%s, %s, %s, %s, NOW())
+            INSERT INTO leavebalance (empemail, cl, sl, co, lop, lastupdate) 
+            VALUES (%s, %s, %s, %s, %s, NOW())
             """
-            cursor.execute(insert_query, (emp_email, str(casual_days), str(sick_days), str(comp_off_days)))
+            cursor.execute(insert_query, (emp_email, str(casual_days), str(sick_days), 
+                                        str(comp_off_days), str(lop_days)))
         else:
-            # Update existing record
+            # Update existing record with LOP
             update_query = """
             UPDATE leavebalance 
-            SET cl = %s, sl = %s, co = %s, lastupdate = NOW()
+            SET cl = %s, sl = %s, co = %s, lop = %s, lastupdate = NOW()
             WHERE empemail = %s
             """
-            cursor.execute(update_query, (str(casual_days), str(sick_days), str(comp_off_days), emp_email))
+            cursor.execute(update_query, (str(casual_days), str(sick_days), 
+                                        str(comp_off_days), str(lop_days), emp_email))
         
         conn.commit()
         cursor.close()
         conn.close()
-        print(f"✅ Updated leave balance for {emp_email}: CL={casual_days}, SL={sick_days}, CO={comp_off_days}")
+        print(f"✅ Updated leave balance for {emp_email}: CL={casual_days}, SL={sick_days}, CO={comp_off_days}, LOP={lop_days}")
         return True
         
     except Error as e:
         print(f"❌ Database error updating leave balance: {e}")
         return False
 
-def insert_leave_record(leave_data, emp_email, status=0, auto_approval_type=None, approved_days=0):
-    """Insert leave application into leaves table"""
+def insert_leave_record(leave_data, emp_email, status=0, auto_approval_type=None, approved_days=0, lop_days=0):
+    """Insert leave application into leaves table with LOP info"""
     try:
         conn = get_db_connection()
         if not conn:
@@ -139,8 +146,8 @@ def insert_leave_record(leave_data, emp_email, status=0, auto_approval_type=None
         insert_query = """
         INSERT INTO leaves (
             empname, leavetype, `from`, `to`, reason, empemail, status,
-            leavebal, leavetype2, work_location, type_of_auto_approval, approved_days
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            leavebal, leavetype2, work_location, type_of_auto_approval, approved_days, lop_days
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """
         
         # Determine leave type for database
@@ -168,7 +175,8 @@ def insert_leave_record(leave_data, emp_email, status=0, auto_approval_type=None
             leave_type_db,  # leavetype2 same as leavetype
             'Work Location',  # Default work location
             auto_approval_type,  # 'EMERGENCY' or 'NORMAL' or None
-            approved_days  # NEW: Store actual auto-approved days count
+            approved_days,  # Store actual auto-approved days count
+            lop_days  # NEW: Store LOP days for this application
         )
         
         cursor.execute(insert_query, values)
@@ -178,7 +186,7 @@ def insert_leave_record(leave_data, emp_email, status=0, auto_approval_type=None
         cursor.close()
         conn.close()
         
-        print(f"✅ Inserted leave application ID: {leave_id}, Auto-approval type: {auto_approval_type}, Auto-approved days: {approved_days}")
+        print(f"✅ Inserted leave application ID: {leave_id}, Auto-approval type: {auto_approval_type}, Auto-approved days: {approved_days}, LOP days: {lop_days}")
         return leave_id
         
     except Error as e:
@@ -1214,6 +1222,19 @@ def get_excluded_days_info(from_date, to_date):
 
 EMPLOYEE_EMAIL = "putsalaharshapriya@gmail.com"  # Default email, can be changed
 
+def calculate_lop_amount(emp_email, lop_days=None, monthly_salary=30000):
+    """Calculate Loss of Pay amount - optionally get LOP days from database"""
+    if lop_days is None:
+        # Get current LOP from database
+        balance = get_employee_balance(emp_email)
+        lop_days = balance.get('lop', 0)
+    
+    # Convert lop_days to float to avoid Decimal/float type errors
+    lop_days = float(lop_days)
+    per_day_salary = monthly_salary / 30
+    lop_amount = lop_days * per_day_salary
+    return round(lop_amount, 2)
+
 def check_auto_approval_eligibility_db(emp_email, leave_data, balance, is_emergency=False):
     """
     Central function to check if leave can be auto-approved.
@@ -1241,17 +1262,14 @@ def check_auto_approval_eligibility_db(emp_email, leave_data, balance, is_emerge
     monthly_approved_days = get_monthly_auto_approved_days(emp_email, leave_month)
     monthly_emergency_requests = get_monthly_emergency_requests(emp_email, leave_month)
     
-    # Calculate remaining normal auto-approval days
-    remaining_normal_days = 2 - monthly_approved_days
-    
     print(f"\n{'='*60}")
     print(f"🔍 AUTO-APPROVAL ELIGIBILITY CHECK:")
     print(f"   Leave Type: {leave_type}")
     print(f"   Is Emergency: {is_emergency}")
     print(f"   Days Requested: {days}")
     print(f"   Monthly approved days: {monthly_approved_days}/2")
-    print(f"   Remaining normal days: {remaining_normal_days}")
     print(f"   Emergency requests used: {monthly_emergency_requests}/1")
+    print(f"   Balance - Casual: {balance['casual']}, Sick: {balance['sick']}, CompOff: {balance['compOff']}")
     print(f"{'='*60}\n")
     
     # ========== CHECK ELIGIBILITY (BOTH NORMAL AND EMERGENCY) ==========
@@ -1298,8 +1316,52 @@ def check_auto_approval_eligibility_db(emp_email, leave_data, balance, is_emerge
         if monthly_emergency_requests >= 1:
             return (False, f"Emergency request limit exhausted for {leave_month} (max 1 emergency request per month)", 0, days)
         
+        # ========== CRITICAL FIX: Check if we have ANY balance at all ==========
+        # If total_balance is 0 (NO balance), max auto-approval should be 1 day only
+        if total_balance == 0:
+            print(f"⚠️ NO LEAVE BALANCE AVAILABLE - Emergency max auto-approval: 1 day only")
+            
+            # Case 1: No auto-approved days used yet (0 used)
+            if monthly_approved_days == 0:
+                if days == 1:
+                    # 0 used, 1 emergency day → 1 auto-approved (LOP), 0 to HR
+                    approved = 1
+                    hr_review = 0
+                    return (True, "Emergency auto-approved (1 day - No balance)", approved, hr_review)
+                elif days >= 2:
+                    # 0 used, 2+ emergency days → 1 auto-approved (LOP), remaining to HR
+                    approved = 1
+                    hr_review = days - approved
+                    return (True, f"Emergency partial auto-approved (1 day - No balance)", approved, hr_review)
+            
+            # Case 2: Some auto-approved days already used
+            elif monthly_approved_days == 1:
+                if days == 1:
+                    # 1 used, 1 emergency day → 1 auto-approved (LOP), 0 to HR
+                    approved = 1
+                    hr_review = 0
+                    return (True, "Emergency auto-approved (1 day - No balance)", approved, hr_review)
+                elif days >= 2:
+                    # 1 used, 2+ emergency days → 1 auto-approved (LOP), remaining to HR
+                    approved = 1
+                    hr_review = days - approved
+                    return (True, f"Emergency partial auto-approved (1 day - No balance)", approved, hr_review)
+            
+            # Case 3: 2 auto-approved days already used (FULL quota used)
+            elif monthly_approved_days >= 2:
+                # Emergency override: can approve 1 day as bonus
+                if days == 1:
+                    # 2 used, 1 emergency day → 1 override auto-approved (LOP), 0 to HR
+                    approved = 1
+                    hr_review = 0
+                    return (True, "Emergency override auto-approved (1 day bonus - No balance)", approved, hr_review)
+                elif days >= 2:
+                    # 2 used, 2+ emergency days → 1 override auto-approved (LOP), remaining to HR
+                    approved = 1
+                    hr_review = days - approved
+                    return (True, "Emergency override partial auto-approved (1 day bonus - No balance)", approved, hr_review)
+        
         # ========== ELIGIBILITY CHECK FOR EMERGENCY ==========
-        # 🔴 CRITICAL CHANGE: Emergency should check eligibility, but allow 1 day as override if not eligible
         if not is_eligible:
             # Not eligible - can only auto-approve 1 day maximum
             print(f"⚠️ Employee NOT eligible for full auto-approval. Emergency override: max 1 day")
@@ -1316,8 +1378,6 @@ def check_auto_approval_eligibility_db(emp_email, leave_data, balance, is_emerge
                 return (True, f"Emergency partial auto-approved (1 day - eligibility override)", approved, hr_review)
         
         # ========== ELIGIBLE EMPLOYEE EMERGENCY LOGIC ==========
-        # If eligible, follow the original table rules
-        
         # Case 1: No auto-approved days used yet (0 used)
         if monthly_approved_days == 0:
             if days == 1:
@@ -1443,8 +1503,10 @@ def process_leave_application(emp_email, leave_data):
     balance = {
         'casual': float(balance.get('casual', 0)),
         'sick': float(balance.get('sick', 0)),
-        'compOff': float(balance.get('compOff', 0))
+        'compOff': float(balance.get('compOff', 0)),
+        'lop': float(balance.get('lop', 0))
     }
+    
     used_type = ""
     used_parts = []
     leave_type = leave_data.get('leaveType')
@@ -1467,6 +1529,7 @@ def process_leave_application(emp_email, leave_data):
     print(f"   From: {from_date_str}")
     print(f"   To: {to_date_str}")
     print(f"   Is Emergency: {is_emergency}")
+    print(f"   Balance - Casual: {balance['casual']}, Sick: {balance['sick']}, CompOff: {balance['compOff']}")
     print(f"{'='*60}\n")
     
     # ========== CHECK ELIGIBILITY ==========
@@ -1575,6 +1638,10 @@ Your leave application will be sent to {recipient} for review.''',
     
     # ========== AUTO-APPROVE LOGIC ==========
     if approved_days > 0:
+        print(f"📋 AUTO-APPROVAL SUMMARY:")
+        print(f"   Approved Days: {approved_days}")
+        print(f"   HR Review Days: {hr_days}")
+        
         # Convert approved_days and hr_days to float
         approved_days = float(approved_days)
         hr_days = float(hr_days)
@@ -1587,22 +1654,25 @@ Your leave application will be sent to {recipient} for review.''',
         new_balance = {
             'casual': float(balance['casual']),
             'sick': float(balance['sick']),
-            'compOff': float(balance['compOff'])
+            'compOff': float(balance['compOff']),
+            'lop': float(balance['lop'])
         }
         
         remaining_to_approve = float(approved_days)
+        lop_to_increment = 0.0
         
         # ========== CHECK REASON FOR COMP OFF ==========
         reason = leave_data.get('reason', '')
         classification = classify_reason(reason) if reason else 'casual'
         
-        # ========== DEDUCTION PRIORITY LOGIC ==========
+        # ========== NEW DEDUCTION LOGIC WITH LOP COLUMN ==========
         if leave_type == 'casual':
             # CASUAL LEAVE: Casual → Comp Off
             print(f"\n{'='*60}")
-            print(f"💰 CASUAL LEAVE DEDUCTION PRIORITY:")
+            print(f"💰 CASUAL LEAVE DEDUCTION (WITH LOP COLUMN):")
             print(f"   Remaining to approve: {remaining_to_approve}")
             print(f"   Priority: Casual → Comp Off")
+            print(f"   Current LOP: {new_balance['lop']}")
             print(f"{'='*60}\n")
             
             # 1. Use Casual Leave first
@@ -1624,12 +1694,20 @@ Your leave application will be sent to {recipient} for review.''',
                     remaining_to_approve -= compoff_used
                     print(f"   Used {compoff_used} Comp Off, Remaining: {remaining_to_approve}")
             
+            # 3. Any remaining goes to LOP column (NOT negative balances)
+            if remaining_to_approve > 0:
+                lop_to_increment = remaining_to_approve
+                used_parts.append(f"{remaining_to_approve} LOP")
+                print(f"   LOP to increment: {lop_to_increment}")
+                remaining_to_approve = 0
+                
         elif leave_type == 'sick':
             # SICK LEAVE: Sick → Comp Off → Casual
             print(f"\n{'='*60}")
-            print(f"💰 SICK LEAVE DEDUCTION PRIORITY:")
+            print(f"💰 SICK LEAVE DEDUCTION (WITH LOP COLUMN):")
             print(f"   Remaining to approve: {remaining_to_approve}")
             print(f"   Priority: Sick → Comp Off → Casual")
+            print(f"   Current LOP: {new_balance['lop']}")
             print(f"{'='*60}\n")
             
             # 1. Use Sick Leave first
@@ -1659,14 +1737,22 @@ Your leave application will be sent to {recipient} for review.''',
                     used_parts.append(f"{casual_used} Casual Leave")
                     new_balance['casual'] -= casual_used
                     remaining_to_approve -= casual_used
-                    print(f"   Used {casual_used} Casual Leave, Remaining: {remaining_to_approve}")
+                print(f"   Used {casual_used} Casual Leave, Remaining: {remaining_to_approve}")
             
+            # 4. Any remaining goes to LOP column (NOT negative balances)
+            if remaining_to_approve > 0:
+                lop_to_increment = remaining_to_approve
+                used_parts.append(f"{remaining_to_approve} LOP")
+                print(f"   LOP to increment: {lop_to_increment}")
+                remaining_to_approve = 0
+                
         elif leave_type == 'compOff':
             # COMP OFF: Check reason classification
             print(f"\n{'='*60}")
-            print(f"💰 COMP OFF DEDUCTION PRIORITY:")
+            print(f"💰 COMP OFF DEDUCTION (WITH LOP COLUMN):")
             print(f"   Remaining to approve: {remaining_to_approve}")
             print(f"   Reason Classification: {classification}")
+            print(f"   Current LOP: {new_balance['lop']}")
             print(f"{'='*60}\n")
             
             if classification == 'sick':
@@ -1701,6 +1787,13 @@ Your leave application will be sent to {recipient} for review.''',
                         new_balance['casual'] -= casual_used
                         remaining_to_approve -= casual_used
                         print(f"   Used {casual_used} Casual Leave, Remaining: {remaining_to_approve}")
+                
+                # 4. Any remaining goes to LOP column (NOT negative balances)
+                if remaining_to_approve > 0:
+                    lop_to_increment = remaining_to_approve
+                    used_parts.append(f"{remaining_to_approve} LOP")
+                    print(f"   LOP to increment: {lop_to_increment}")
+                    remaining_to_approve = 0
             
             else:
                 # Comp Off with CASUAL reason: Comp Off → Casual
@@ -1724,23 +1817,21 @@ Your leave application will be sent to {recipient} for review.''',
                         new_balance['casual'] -= casual_used
                         remaining_to_approve -= casual_used
                         print(f"   Used {casual_used} Casual Leave, Remaining: {remaining_to_approve}")
-        
-        # Handle LOP for any remaining balance after checking ALL types
-        if remaining_to_approve > 0:
-            # LOP is always deducted from the requested leave type
-            if leave_type == 'casual':
-                lop_type = 'Casual Leave'
-                new_balance['casual'] -= remaining_to_approve
-            elif leave_type == 'sick':
-                lop_type = 'Sick Leave'
-                new_balance['sick'] -= remaining_to_approve
-            elif leave_type == 'compOff':
-                # For comp off, LOP goes to Casual Leave
-                lop_type = 'Casual Leave'
-                new_balance['casual'] -= remaining_to_approve
-            
-            used_parts.append(f"-{remaining_to_approve} {lop_type} (LOP)")
-            print(f"   LOP: {remaining_to_approve} {lop_type} (LOP)")
+                
+                # 3. Any remaining goes to LOP column (NOT negative balances)
+                if remaining_to_approve > 0:
+                    lop_to_increment = remaining_to_approve
+                    used_parts.append(f"{remaining_to_approve} LOP")
+                    print(f"   LOP to increment: {lop_to_increment}")
+                    remaining_to_approve = 0
+
+        # Ensure no negative balances (safety check)
+        new_balance['casual'] = max(0, new_balance['casual'])
+        new_balance['sick'] = max(0, new_balance['sick'])
+        new_balance['compOff'] = max(0, new_balance['compOff'])
+
+        # Update LOP in balance
+        new_balance['lop'] += lop_to_increment
         
         # Build used_type from used_parts
         if used_parts:
@@ -1748,12 +1839,13 @@ Your leave application will be sent to {recipient} for review.''',
         else:
             used_type = f"{approved_days} day(s)"
         
-        # ========== CRITICAL CHANGE: AUTO-APPROVE IMMEDIATELY ==========
+        # ========== CRITICAL FIX: AUTO-APPROVE IMMEDIATELY ==========
         # Auto-approve the eligible days automatically (no user confirmation needed)
         
-        # Update leave balance in database for auto-approved days
+        # Update leave balance in database for auto-approved days WITH LOP
         update_employee_balance(emp_email, new_balance['casual'], 
-                              new_balance['sick'], new_balance['compOff'])
+                              new_balance['sick'], new_balance['compOff'],
+                              new_balance['lop'])
         
         # Insert leave application with approved status for auto-approved days
         status = 1  # Approved
@@ -1761,13 +1853,16 @@ Your leave application will be sent to {recipient} for review.''',
         
         # Check if we need to ask user about remaining days
         if hr_days > 0:
-            leave_id = insert_leave_record(leave_data, emp_email, status, auto_approval_type, approved_days=approved_days)
+            # CRITICAL FIX: Insert Record 1 - Auto-approved portion
+            leave_id = insert_leave_record(leave_data, emp_email, status, auto_approval_type, 
+                                         approved_days=approved_days, lop_days=lop_to_increment)
             
             if leave_id:
                 remarks = f"Auto-approved {approved_days} day(s) using {used_type}"
                 update_leave_status_db(leave_id, status, remarks, "SYSTEM", auto_approval_type)
                 
                 # Store leave data for HR/Manager review (Record 2)
+                # IMPORTANT: Store the ORIGINAL leave_data for remaining days
                 session['remaining_leave_data'] = leave_data.copy()  # Store copy of SAME data
                 session['remaining_days'] = float(hr_days)  # Convert to float
                 session['already_approved_days'] = float(approved_days)  # Convert to float
@@ -1873,17 +1968,18 @@ Your leave application will be sent to {recipient} for review.''',
                 if hr_balance_usage:
                     hr_usage_text = " + ".join(hr_balance_usage)
                     if hr_lop_days > 0:
-                        lop_amount = calculate_lop_amount(hr_lop_days)
+                        lop_amount = calculate_lop_amount(emp_email, hr_lop_days)
                         hr_usage_text += f" + {hr_lop_days} LOP (₹{lop_amount})"
                 else:
                     if hr_lop_days > 0:
-                        lop_amount = calculate_lop_amount(hr_lop_days)
+                        lop_amount = calculate_lop_amount(emp_email, hr_lop_days)
                         hr_usage_text = f"{hr_lop_days} LOP (₹{lop_amount})"
                     else:
                         hr_usage_text = "available balance"
                 
                 # Build response message
                 recipient = "HR" if is_emergency else "Manager/HR"
+                lop_amount = calculate_lop_amount(emp_email, lop_to_increment)
                 
                 response_msg = f'''✅ {approved_days} day(s) have been auto-approved using {used_type}!
 
@@ -1893,26 +1989,12 @@ Your updated leave balance (after auto-approval):
 📅 Casual Leave: {new_balance['casual']} days
 🏥 Sick Leave: {new_balance['sick']} days
 ⏰ Comp Off: {new_balance['compOff']} days
+💰 LOP Days: {new_balance['lop']} days (₹{lop_amount})
 
 📊 Monthly auto-approved days used for {leave_month}: {float(monthly_approved) + approved_days}/2'''
                 
                 if is_emergency:
                     response_msg += f"\n\n🚨 Emergency requests used for {leave_month}: {int(monthly_emergency) + 1}/1"
-                
-                # Add LOP warning for auto-approved portion if any
-                auto_lop_details = []
-                if new_balance['casual'] < 0:
-                    lop_days = abs(new_balance['casual'])
-                    lop_amount = calculate_lop_amount(lop_days)
-                    auto_lop_details.append(f"{lop_days} day(s) Casual Leave (₹{lop_amount} LOP)")
-                
-                if new_balance['sick'] < 0:
-                    lop_days = abs(new_balance['sick'])
-                    lop_amount = calculate_lop_amount(lop_days)
-                    auto_lop_details.append(f"{lop_days} day(s) Sick Leave (₹{lop_amount} LOP)")
-                
-                if auto_lop_details:
-                    response_msg += f"\n\n⚠️ Loss of Pay deducted for auto-approved portion: " + ", ".join(auto_lop_details)
                 
                 # Add HR portion info
                 response_msg += f"\n\n📋 If {recipient} approves the remaining {hr_days} day(s), it will use: {hr_usage_text}"
@@ -1938,39 +2020,26 @@ Your updated leave balance (after auto-approval):
             # All days auto-approved - show success message
             leave_id = insert_leave_record(leave_data, emp_email, 1, 
                                          'EMERGENCY' if is_emergency else 'NORMAL', 
-                                         approved_days=approved_days)
+                                         approved_days=approved_days, lop_days=lop_to_increment)
             
             if leave_id:
                 remarks = f"Auto-approved {approved_days} day(s) using {used_type}"
                 update_leave_status_db(leave_id, 1, remarks, "SYSTEM", 
                                      'EMERGENCY' if is_emergency else 'NORMAL')
                 
+                lop_amount = calculate_lop_amount(emp_email, lop_to_increment)
                 response_msg = f'''✅ {approved_days} day(s) have been auto-approved using {used_type}!
 
 Your updated leave balance:
 📅 Casual Leave: {new_balance['casual']} days
 🏥 Sick Leave: {new_balance['sick']} days
 ⏰ Comp Off: {new_balance['compOff']} days
+💰 LOP Days: {new_balance['lop']} days (₹{lop_amount})
 
 📊 Monthly auto-approved days used for {leave_month}: {float(monthly_approved) + approved_days}/2'''
                 
                 if is_emergency:
                     response_msg += f"\n\n🚨 Emergency requests used for {leave_month}: {int(monthly_emergency) + 1}/1"
-                
-                # Add LOP warning if any
-                auto_lop_details = []
-                if new_balance['casual'] < 0:
-                    lop_days = abs(new_balance['casual'])
-                    lop_amount = calculate_lop_amount(lop_days)
-                    auto_lop_details.append(f"{lop_days} day(s) Casual Leave (₹{lop_amount} LOP)")
-                
-                if new_balance['sick'] < 0:
-                    lop_days = abs(new_balance['sick'])
-                    lop_amount = calculate_lop_amount(lop_days)
-                    auto_lop_details.append(f"{lop_days} day(s) Sick Leave (₹{lop_amount} LOP)")
-                
-                if auto_lop_details:
-                    response_msg += f"\n\n⚠️ Loss of Pay deducted: " + ", ".join(auto_lop_details)
                 
                 return {
                     'response': response_msg,
@@ -2032,14 +2101,6 @@ def check_leave_eligibility():
     is_eligible = len(violations) == 0
     return is_eligible, violations
 
-def calculate_lop_amount(lop_days, monthly_salary=30000):
-    """Calculate Loss of Pay amount"""
-    # Convert lop_days to float to avoid Decimal/float type errors
-    lop_days = float(lop_days)
-    per_day_salary = monthly_salary / 30
-    lop_amount = lop_days * per_day_salary
-    return round(lop_amount, 2)
-
 def is_employee_sick(reason):
     """
     Decide if the employee is sick using the AI model.
@@ -2087,36 +2148,40 @@ Your application cannot be processed.''',
             new_balance = {
                 'casual': float(balance['casual']),
                 'sick': float(balance['sick']),
-                'compOff': float(balance['compOff'])
+                'compOff': float(balance['compOff']),
+                'lop': float(balance['lop'])
             }
             
             # Calculate what to use based on priority
+            lop_to_increment = 0.0
+            used_parts = []
+            
             if leave_type == 'casual':
                 # Casual: Casual → Comp Off
                 if new_balance['casual'] >= 1:
                     new_balance['casual'] -= 1
-                    used_type = "1 Casual Leave"
+                    used_parts.append(f"1 Casual Leave")
                 elif new_balance['compOff'] >= 1:
                     new_balance['compOff'] -= 1
-                    used_type = "1 Comp Off"
+                    used_parts.append(f"1 Comp Off")
                 else:
-                    new_balance['casual'] -= 1
-                    used_type = "1 Casual Leave (LOP)"
+                    lop_to_increment = 1
+                    used_parts.append(f"1 LOP")
             
             elif leave_type == 'sick':
                 # Sick: Sick → Comp Off → Casual
                 if new_balance['sick'] >= 1:
                     new_balance['sick'] -= 1
-                    used_type = "1 Sick Leave"
+                    used_parts.append(f"1 Sick Leave")
                 elif new_balance['compOff'] >= 1:
                     new_balance['compOff'] -= 1
-                    used_type = "1 Comp Off"
+                    used_parts.append(f"1 Comp Off")
                 elif new_balance['casual'] >= 1:
                     new_balance['casual'] -= 1
-                    used_type = "1 Casual Leave"
+                    used_parts.append(f"1 Casual Leave")
                 else:
-                    new_balance['sick'] -= 1
-                    used_type = "1 Sick Leave (LOP)"
+                    lop_to_increment = 1
+                    used_parts.append(f"1 LOP")
             
             elif leave_type == 'compOff':
                 classification = classify_reason(reason) if reason else 'casual'
@@ -2124,44 +2189,48 @@ Your application cannot be processed.''',
                     # Comp off with SICK reason: Comp Off → Sick → Casual
                     if new_balance['compOff'] >= 1:
                         new_balance['compOff'] -= 1
-                        used_type = "1 Comp Off"
+                        used_parts.append(f"1 Comp Off")
                     elif new_balance['sick'] >= 1:
                         new_balance['sick'] -= 1
-                        used_type = "1 Sick Leave"
+                        used_parts.append(f"1 Sick Leave")
                     elif new_balance['casual'] >= 1:
                         new_balance['casual'] -= 1
-                        used_type = "1 Casual Leave"
+                        used_parts.append(f"1 Casual Leave")
                     else:
-                        new_balance['casual'] -= 1
-                        used_type = "1 Casual Leave (LOP)"
+                        lop_to_increment = 1
+                        used_parts.append(f"1 LOP")
                 else:
                     # Comp off with CASUAL reason: Comp Off → Casual
                     if new_balance['compOff'] >= 1:
                         new_balance['compOff'] -= 1
-                        used_type = "1 Comp Off"
+                        used_parts.append(f"1 Comp Off")
                     elif new_balance['casual'] >= 1:
                         new_balance['casual'] -= 1
-                        used_type = "1 Casual Leave"
+                        used_parts.append(f"1 Casual Leave")
                     else:
-                        new_balance['casual'] -= 1
-                        used_type = "1 Casual Leave (LOP)"
+                        lop_to_increment = 1
+                        used_parts.append(f"1 LOP")
+            
+            # Ensure no negative balances
+            new_balance['casual'] = max(0, new_balance['casual'])
+            new_balance['sick'] = max(0, new_balance['sick'])
+            new_balance['compOff'] = max(0, new_balance['compOff'])
+            new_balance['lop'] += lop_to_increment
             
             # Update database
             update_employee_balance(emp_email, new_balance['casual'], 
-                                  new_balance['sick'], new_balance['compOff'])
+                                  new_balance['sick'], new_balance['compOff'],
+                                  new_balance['lop'])
             
             # Insert leave as auto-approved emergency
-            leave_id = insert_leave_record(leave_data, emp_email, 1, 'EMERGENCY', approved_days=1.0)
+            leave_id = insert_leave_record(leave_data, emp_email, 1, 'EMERGENCY', 
+                                         approved_days=1.0, lop_days=lop_to_increment)
             
             if leave_id:
                 update_leave_status_db(leave_id, 1, "Emergency override (1 day bonus) - Auto-approved", "SYSTEM", 'EMERGENCY')
                 
-                # Check for LOP
-                lop_details = ""
-                if new_balance['casual'] < 0 or new_balance['sick'] < 0:
-                    lop_days = 1
-                    lop_amount = calculate_lop_amount(lop_days)
-                    lop_details = f"\n\n⚠️ Loss of Pay deducted: ₹{lop_amount}"
+                used_type = " + ".join(used_parts) if used_parts else "1 day"
+                lop_amount = calculate_lop_amount(emp_email, lop_to_increment)
                 
                 return {
                     'response': f'''✅ 1 day emergency leave auto-approved as bonus override!
@@ -2169,12 +2238,13 @@ Your application cannot be processed.''',
 Since you've used all monthly auto-approval quota (2/2 days),
 but haven't used emergency quota, 1 day has been auto-approved as emergency bonus.
 
-Approved using: {used_type}{lop_details}
+Approved using: {used_type}
 
 Your updated leave balance:
 📅 Casual Leave: {new_balance['casual']} days
 🏥 Sick Leave: {new_balance['sick']} days
 ⏰ Comp Off: {new_balance['compOff']} days
+💰 LOP Days: {new_balance['lop']} days (₹{lop_amount})
 
 🚨 Emergency requests used for {leave_month}: {emergency_requests + 1}/1''',
                     'buttons': [{'text': 'Start Again', 'action': 'startAgain'}],
@@ -2261,10 +2331,10 @@ Your updated leave balance:
     
     # Add LOP if any remaining days
     if remaining > 0:
-        lop_amount = calculate_lop_amount(remaining)
+        lop_amount = calculate_lop_amount(emp_email, remaining)
         parts.append(f"{remaining} LOP (₹{lop_amount})")
     
-    leave_source = " + ".join(parts) if parts else f"{days} LOP (₹{calculate_lop_amount(days)})"
+    leave_source = " + ".join(parts) if parts else f"{days} LOP (₹{calculate_lop_amount(emp_email, days)})"
     
     # Store leave data for final submission
     session['pending_approval'] = True
@@ -2282,6 +2352,7 @@ Your current balance (unchanged until approval):
 📅 Casual Leave: {balance['casual']} days
 🏥 Sick Leave: {balance['sick']} days
 ⏰ Comp Off: {balance['compOff']} days
+💰 LOP Days: {balance['lop']} days (₹{calculate_lop_amount(emp_email, balance['lop'])})
 
 Do you want to submit for {recipient} approval?''',
         'buttons': [
@@ -2376,28 +2447,27 @@ Your application cannot be processed.''',
             new_balance = {
                 'casual': float(balance['casual']),
                 'sick': float(balance['sick']),
-                'compOff': float(balance['compOff'])
+                'compOff': float(balance['compOff']),
+                'lop': float(balance['lop'])
             }
             
-            if leave_type == 'casual':
-                new_balance['casual'] = float(balance['casual']) - 1.0
-            elif leave_type == 'sick':
-                new_balance['sick'] = float(balance['sick']) - 1.0
-            elif leave_type == 'compOff':
-                new_balance['casual'] = float(balance['casual']) - 1.0
+            lop_to_increment = 1.0
+            new_balance['lop'] += lop_to_increment
             
             # Update database
             update_employee_balance(emp_email, new_balance['casual'], 
-                                  new_balance['sick'], new_balance['compOff'])
+                                  new_balance['sick'], new_balance['compOff'],
+                                  new_balance['lop'])
             
             # Insert leave as auto-approved emergency
             status = 1  # Approved
-            leave_id = insert_leave_record(leave_data, emp_email, status, 'EMERGENCY', approved_days=1.0)
+            leave_id = insert_leave_record(leave_data, emp_email, status, 'EMERGENCY', 
+                                         approved_days=1.0, lop_days=lop_to_increment)
             
             if leave_id:
                 update_leave_status_db(leave_id, status, "Emergency override with LOP - Auto-approved", "SYSTEM", 'EMERGENCY')
                 
-                lop_amount = calculate_lop_amount(1)
+                lop_amount = calculate_lop_amount(emp_email, lop_to_increment)
                 return {
                     'response': f'''✅ 1 day emergency leave auto-approved!
 
@@ -2408,6 +2478,7 @@ Your updated leave balance:
 📅 Casual Leave: {new_balance['casual']} days
 🏥 Sick Leave: {new_balance['sick']} days
 ⏰ Comp Off: {new_balance['compOff']} days
+💰 LOP Days: {new_balance['lop']} days (₹{lop_amount})
 
 🚨 Emergency request quota used: 1/1''',
                     'buttons': [{'text': 'Start Again', 'action': 'startAgain'}],
@@ -2426,7 +2497,7 @@ Your updated leave balance:
             recipient = "HR" if is_emergency else "Manager/HR"
             status = 0 if is_emergency else 4
             
-            lop_amount = calculate_lop_amount(days)
+            lop_amount = calculate_lop_amount(emp_email, days)
             
             session['pending_approval'] = True
             session['needs_review'] = True
@@ -2439,6 +2510,7 @@ Current balance:
 📅 Casual Leave: {balance['casual']} days
 🏥 Sick Leave: {balance['sick']} days
 ⏰ Comp Off: {balance['compOff']} days
+💰 LOP Days: {balance['lop']} days (₹{calculate_lop_amount(emp_email, balance['lop'])})
 
 This will affect your KPI and ₹{lop_amount} LOP will be deducted from your salary for {days} day(s).
 This request requires {recipient} approval (LOP is never auto-approved).
@@ -2460,7 +2532,7 @@ Do you want to proceed to {recipient} review?''',
         
         if shortfall > 0:
             # Partial LOP required
-            lop_amount = calculate_lop_amount(shortfall)
+            lop_amount = calculate_lop_amount(emp_email, shortfall)
             
             # Check eligibility for auto-approval
             if is_emergency:
@@ -2478,6 +2550,7 @@ Balance available:
 📅 Casual Leave: {balance['casual']} days
 🏥 Sick Leave: {balance['sick']} days
 ⏰ Comp Off: {balance['compOff']} days
+💰 LOP Days: {balance['lop']} days (₹{calculate_lop_amount(emp_email, balance['lop'])})
 
 Shortfall: {shortfall} day(s) LOP (₹{lop_amount})
 
@@ -2579,17 +2652,20 @@ def check_partial_lop_options_db(emp_email, leave_data, balance, is_emergency=Fa
             total_available = balance['compOff'] + balance['casual']
     
     balance_text = "\n".join([f"- {leave_type}: {avail_days} day(s)" for leave_type, avail_days in available_types])
+    lop_amount = calculate_lop_amount(emp_email, balance['lop'])
     
     if total_available > 0:
         shortfall = max(0, days - total_available)
         
         if shortfall > 0:
-            lop_amount = calculate_lop_amount(shortfall)
+            additional_lop = calculate_lop_amount(emp_email, shortfall)
             response_text = f'''⚠️ You have some leave balance available, but partial LOP is required:
 
 {balance_text}
 
-This will use all available balance + {shortfall} LOP day(s) (₹{lop_amount})
+Current LOP Days: {balance['lop']} days (₹{lop_amount})
+
+This will use all available balance + {shortfall} LOP day(s) (₹{additional_lop})
 Requires HR approval (LOP is never auto-approved).
 
 Would you like to proceed?'''
@@ -2611,6 +2687,8 @@ Would you like to proceed?'''
 
 {balance_text}
 
+Current LOP Days: {balance['lop']} days (₹{lop_amount})
+
 This will use all available balance to cover {days} day(s).
 
 Would you like to proceed?'''
@@ -2630,7 +2708,8 @@ Would you like to proceed?'''
 def proceed_to_lop_db(emp_email, leave_data, balance, is_emergency=False):
     """Handle full LOP case - NO balance at all"""
     days = leave_data.get('duration', 0)
-    lop_amount = calculate_lop_amount(days)
+    lop_amount = calculate_lop_amount(emp_email, days)
+    current_lop_amount = calculate_lop_amount(emp_email, balance['lop'])
     
     recipient = "HR" if is_emergency else "Manager/HR"
     status = 0 if is_emergency else 4
@@ -2646,6 +2725,7 @@ Current balance:
 📅 Casual Leave: {balance['casual']} days
 🏥 Sick Leave: {balance['sick']} days
 ⏰ Comp Off: {balance['compOff']} days
+💰 LOP Days: {balance['lop']} days (₹{current_lop_amount})
 
 This will affect your KPI and ₹{lop_amount} LOP will be deducted from your salary for {days} day(s).
 This request requires {recipient} approval (LOP is never auto-approved).
@@ -2665,7 +2745,7 @@ app.secret_key = secrets.token_hex(16)
 
 # Initialize session data
 def init_session():
-    # Get balance from database for the employee
+    # Get balance from database for the employee INCLUDING LOP
     balance = get_employee_balance(EMPLOYEE_EMAIL)
     session['leave_balance'] = balance
     
@@ -2685,6 +2765,10 @@ def init_session():
     
     if 'employee_salary' not in session:
         session['employee_salary'] = 30000
+    
+    # Add LOP to session
+    if 'lop_amount' not in session:
+        session['lop_amount'] = calculate_lop_amount(EMPLOYEE_EMAIL)
     
     session.modified = True
 
@@ -2955,6 +3039,7 @@ def index():
 def init():
     init_session()
     balance = session['leave_balance']
+    lop_amount = calculate_lop_amount(EMPLOYEE_EMAIL, balance['lop'])
     
     return jsonify({
         'response': f'''Welcome! 👋 How can I help you today?
@@ -2962,7 +3047,8 @@ def init():
 Your current leave balance:
 📅 Casual Leave: {balance['casual']} days
 🏥 Sick Leave: {balance['sick']} days
-⏰ Comp Off: {balance['compOff']} days''',
+⏰ Comp Off: {balance['compOff']} days
+💰 LOP Days: {balance['lop']} days (₹{lop_amount})''',
         'buttons': [
             {'text': 'Apply for a Leave', 'action': 'applyLeave'},
             {'text': 'Check Leave Balance', 'action': 'checkBalance'},
@@ -2995,10 +3081,12 @@ def handle_action():
         response['state'] = 'selectLeaveType'
         
     elif action == 'checkBalance':
+        lop_amount = calculate_lop_amount(EMPLOYEE_EMAIL, balance['lop'])
         response['response'] = f'''Your current leave balance:
 📅 Casual Leave: {balance['casual']} days
 🏥 Sick Leave: {balance['sick']} days
-⏰ Comp Off: {balance['compOff']} days'''
+⏰ Comp Off: {balance['compOff']} days
+💰 LOP Days: {balance['lop']} days (₹{lop_amount})'''
         response['buttons'] = [
             {'text': 'Apply for a Leave', 'action': 'applyLeave'},
             {'text': 'Check Leave Balance', 'action': 'checkBalance'}
@@ -3006,13 +3094,18 @@ def handle_action():
         
     elif action == 'canApply':
         has_leaves = balance['casual'] > 0 or balance['sick'] > 0 or balance['compOff'] > 0
+        lop_amount = calculate_lop_amount(EMPLOYEE_EMAIL, balance['lop'])
+        
         if has_leaves:
             response['response'] = f'''Yes, you can apply for leave! You have:
 📅 Casual Leave: {balance['casual']} days
 🏥 Sick Leave: {balance['sick']} days
-⏰ Comp Off: {balance['compOff']} days'''
+⏰ Comp Off: {balance['compOff']} days
+💰 LOP Days: {balance['lop']} days (₹{lop_amount})'''
         else:
-            response['response'] = 'You currently have no leave balance. Applying for leave will result in Loss of Pay (LOP) and may affect your KPI.'
+            response['response'] = f'''You currently have no leave balance. Applying for leave will result in Loss of Pay (LOP) and may affect your KPI.
+
+Current LOP Days: {balance['lop']} days (₹{lop_amount})'''
         response['buttons'] = [
             {'text': 'Yes, Apply Leave', 'action': 'applyLeave'},
             {'text': 'No, Thanks', 'action': 'end'}
@@ -3071,12 +3164,16 @@ Please enter your reason:'''
         current_month_name = datetime.now().strftime('%B %Y')
         next_month_name = (datetime.now().replace(day=1) + timedelta(days=32)).replace(day=1).strftime('%B %Y')
         
+        lop_amount = calculate_lop_amount(EMPLOYEE_EMAIL, balance['lop'])
+        
         metrics = f'''📊 Your Performance Metrics:
 
 📅 Last Month Attendance: {session.get('last_month_attendance', 95.0)}%
 💼 Last Month Performance: {session.get('last_month_performance', 95.0)}%
 ⏰ Late Minutes Used: {session.get('late_minutes_used', 0)}/120 minutes
 📈 Last 3 Months Avg Attendance: {session.get('last_3_months_attendance', 75.0)}%
+
+💰 Current LOP Days: {balance['lop']} days (₹{lop_amount})
 
 📆 Monthly Leave Tracking:
 {current_month_name}:
@@ -3213,16 +3310,17 @@ Please enter your reason:'''
         
         # ✅ CRITICAL FIX: Insert Record 2 with SAME leave_data (same dates, same duration)
         # Only difference is the STATUS field
-        leave_id = insert_leave_record(remaining_data, EMPLOYEE_EMAIL, status,approved_days=0)
+        leave_id = insert_leave_record(remaining_data, EMPLOYEE_EMAIL, status, approved_days=0)
         
         if leave_id:
             # Calculate what balance will be used if HR approves
             balance = get_employee_balance(EMPLOYEE_EMAIL)
             balance = {
-        'casual': float(balance.get('casual', 0)),
-        'sick': float(balance.get('sick', 0)),
-        'compOff': float(balance.get('compOff', 0))
-    }
+                'casual': float(balance.get('casual', 0)),
+                'sick': float(balance.get('sick', 0)),
+                'compOff': float(balance.get('compOff', 0)),
+                'lop': float(balance.get('lop', 0))
+            }
             leave_type = remaining_data.get('leaveType')
             reason = remaining_data.get('reason', '')
             
@@ -3320,15 +3418,16 @@ Please enter your reason:'''
             if hr_balance_usage:
                 hr_usage_text = " + ".join(hr_balance_usage)
                 if hr_lop_days > 0:
-                    lop_amount = calculate_lop_amount(hr_lop_days)
+                    lop_amount = calculate_lop_amount(EMPLOYEE_EMAIL, hr_lop_days)
                     hr_usage_text += f" + {hr_lop_days} LOP (₹{lop_amount})"
             else:
                 if hr_lop_days > 0:
-                    lop_amount = calculate_lop_amount(hr_lop_days)
+                    lop_amount = calculate_lop_amount(EMPLOYEE_EMAIL, hr_lop_days)
                     hr_usage_text = f"{hr_lop_days} LOP (₹{lop_amount})"
                 else:
                     hr_usage_text = "available balance"
             
+            lop_amount = calculate_lop_amount(EMPLOYEE_EMAIL, balance['lop'])
             response['response'] = f'''✅ Your remaining {remaining_days} day(s) have been submitted to {recipient} for approval!
 
 Leave Application Summary:
@@ -3340,7 +3439,8 @@ If {recipient} approves, it will use: {hr_usage_text}
 Your current leave balance (unchanged until {recipient} approves):
 📅 Casual Leave: {balance['casual']} days
 🏥 Sick Leave: {balance['sick']} days
-⏰ Comp Off: {balance['compOff']} days'''
+⏰ Comp Off: {balance['compOff']} days
+💰 LOP Days: {balance['lop']} days (₹{lop_amount})'''
         else:
             response['response'] = '❌ Error submitting remaining leave. Please try again.'
         
@@ -3369,30 +3469,42 @@ Your current leave balance (unchanged until {recipient} approves):
         balance = {
             'casual': float(balance.get('casual', 0)),
             'sick': float(balance.get('sick', 0)),
-            'compOff': float(balance.get('compOff', 0))
+            'compOff': float(balance.get('compOff', 0)),
+            'lop': float(balance.get('lop', 0))
         }
         
-        # Auto-approve 1 day
+        # Auto-approve 1 day with LOP logic
         new_balance = balance.copy()
         leave_type = leave_data.get('leaveType')
+        
+        lop_to_increment = 0.0
+        used_parts = []
         
         if leave_type == 'casual':
             if new_balance['casual'] >= 1:
                 new_balance['casual'] -= 1
-                used_type = "1 Casual Leave"
+                used_parts.append(f"1 Casual Leave")
             elif new_balance['compOff'] >= 1:
                 new_balance['compOff'] -= 1
-                used_type = "1 Comp Off"
+                used_parts.append(f"1 Comp Off")
             else:
-                new_balance['casual'] -= 1
-                used_type = "1 Casual Leave (LOP)"
+                lop_to_increment = 1
+                used_parts.append(f"1 LOP")
+        
+        # Ensure no negative balances
+        new_balance['casual'] = max(0, new_balance['casual'])
+        new_balance['sick'] = max(0, new_balance['sick'])
+        new_balance['compOff'] = max(0, new_balance['compOff'])
+        new_balance['lop'] += lop_to_increment
         
         # Update database
         update_employee_balance(EMPLOYEE_EMAIL, new_balance['casual'], 
-                              new_balance['sick'], new_balance['compOff'])
+                              new_balance['sick'], new_balance['compOff'],
+                              new_balance['lop'])
         
         # Insert auto-approved record
-        leave_id = insert_leave_record(leave_data, EMPLOYEE_EMAIL, 1, 'EMERGENCY', approved_days=1.0)
+        leave_id = insert_leave_record(leave_data, EMPLOYEE_EMAIL, 1, 'EMERGENCY', 
+                                     approved_days=1.0, lop_days=lop_to_increment)
         
         if leave_id:
             update_leave_status_db(leave_id, 1, "Emergency auto-approved (1 day - eligibility override)", "SYSTEM", 'EMERGENCY')
@@ -3418,6 +3530,9 @@ Your current leave balance (unchanged until {recipient} approves):
             monthly_approved = get_monthly_auto_approved_days(EMPLOYEE_EMAIL, leave_month)
             monthly_emergency = get_monthly_emergency_requests(EMPLOYEE_EMAIL, leave_month)
             
+            used_type = " + ".join(used_parts) if used_parts else "1 day"
+            lop_amount = calculate_lop_amount(EMPLOYEE_EMAIL, lop_to_increment)
+            
             response['response'] = f'''✅ 1 day has been auto-approved using {used_type} (Emergency eligibility override)!
 
 Since you have eligibility violations, only 1 day can be auto-approved for emergency.
@@ -3428,6 +3543,7 @@ Your updated leave balance (after auto-approval):
 📅 Casual Leave: {new_balance['casual']} days
 🏥 Sick Leave: {new_balance['sick']} days
 ⏰ Comp Off: {new_balance['compOff']} days
+💰 LOP Days: {new_balance['lop']} days (₹{lop_amount})
 
 📊 Monthly auto-approved days used for {leave_month}: {float(monthly_approved) + 1}/2
 🚨 Emergency requests used for {leave_month}: {int(monthly_emergency) + 1}/1
@@ -3538,15 +3654,16 @@ Do you want to submit the remaining {hr_days} day(s) for HR approval?'''
         
         # Add LOP if any remaining days
         if remaining > 0:
-            lop_amount = calculate_lop_amount(remaining)
+            lop_amount = calculate_lop_amount(EMPLOYEE_EMAIL, remaining)
             parts.append(f"{remaining} LOP (₹{lop_amount})")
         
-        leave_source = " + ".join(parts) if parts else f"{days} LOP (₹{calculate_lop_amount(days)})"
+        leave_source = " + ".join(parts) if parts else f"{days} LOP (₹{calculate_lop_amount(EMPLOYEE_EMAIL, days)})"
         
         # Insert leave application (ONLY ONCE - at final submission)
         leave_id = insert_leave_record(leave_data, EMPLOYEE_EMAIL, status, approved_days=0)
         
         if leave_id:
+            lop_amount = calculate_lop_amount(EMPLOYEE_EMAIL, balance['lop'])
             response['response'] = f'''📤 Your leave application has been submitted and is waiting for {recipient} approval.
 
 Application Details:
@@ -3556,7 +3673,11 @@ Application Details:
 
 If approved, it will use: {leave_source}
 
-Your leave balance remains unchanged pending approval.'''
+Your leave balance remains unchanged pending approval:
+📅 Casual Leave: {balance['casual']} days
+🏥 Sick Leave: {balance['sick']} days
+⏰ Comp Off: {balance['compOff']} days
+💰 LOP Days: {balance['lop']} days (₹{lop_amount})'''
         else:
             response['response'] = '❌ Error submitting leave application. Please try again.'
         
@@ -3594,12 +3715,15 @@ Your leave balance remains unchanged pending approval.'''
         session.pop('remaining_days', None)
         session.pop('already_approved_days', None)
         
+        lop_amount = calculate_lop_amount(EMPLOYEE_EMAIL, balance['lop'])
+        
         response['response'] = f'''Welcome back! 👋 How can I help you today?
 
 Your current leave balance:
 📅 Casual Leave: {balance['casual']} days
 🏥 Sick Leave: {balance['sick']} days
-⏰ Comp Off: {balance['compOff']} days'''
+⏰ Comp Off: {balance['compOff']} days
+💰 LOP Days: {balance['lop']} days (₹{lop_amount})'''
         response['buttons'] = [
             {'text': 'Apply for a Leave', 'action': 'applyLeave'},
             {'text': 'Check Leave Balance', 'action': 'checkBalance'},
